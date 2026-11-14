@@ -5,10 +5,18 @@
   couch on | off   force couch / desk mode now
   couch auto       go back to automatic (TV plugged in = couch)
   couch wow-prep   apply the current profile to WoW (the battlenet launcher runs this)
+  couch wow-display start|stop [--pid N]
+                   TV only while WoW runs (layout saved), previous layout back after;
+                   no-op without a TV (the battlenet launcher runs this)
+  couch display    re-apply the screen rule below now
   couch daemon     background service (systemd: couchmode.service)
+  --dry-run        with display / wow-display: check layouts with
+                   `gdctl set --verify`, change and save nothing
 
-Couch mode: TV becomes the only screen (4K, 200% scale, best refresh up to 120Hz),
-sound moves to the TV, controller desktop mode (pad) turns on, and WoW starts with
+Screens (TV plugged in): TV only (4K, 200% scale or ~/.config/gameprofile/tv-scale,
+best refresh up to 60Hz - raise via ~/.config/gameprofile/tv-max-hz, laptop panel off) while the lid is closed, a WoW session runs,
+or `couch on` is set; with the lid open the laptop + TV layout comes back.
+Couch mode: sound moves to the TV, controller desktop mode (pad) turns on, and WoW starts with
 Easy Controller + CouchWheels + couch graphics. Unplugging the TV puts everything back.
 A screen counts as the TV if its EDID is at least 100 cm wide or its name contains "TV".
 Edit WoW per-profile settings in ~/.config/gameprofile/wow-couch.cvars / wow-desk.cvars.
@@ -42,10 +50,15 @@ DEFAULT_CVARS = {
     # TV: 4K output, render at 50% (1080p) and FSR-upscale; the 860M can't render native 4K.
     "couch": {"renderScale": "0.5", "ResampleQuality": "3", "vsync": "1", "maxFPS": "60",
               "GxMaximize": "1", "GamePadEnable": "1", "SoftTargetEnemy": "1",
-              "SoftTargetInteract": "1"},
+              "SoftTargetInteract": "1",
+              # sound on, System Default (= TV sink), keep playing without window focus
+              "Sound_EnableAllSound": "1", "Sound_OutputDriverIndex": "0",
+              "Sound_OutputDriverName": "System Default", "Sound_EnableSoundWhenGameIsInBG": "1"},
     # Desk: the settings tuned on 2026-11-09 for the laptop panel / monitor.
     "desk": {"renderScale": "0.75333333015442", "ResampleQuality": "3", "vsync": "0",
-             "maxFPS": "60", "GxMaximize": "1", "GamePadEnable": "1"},
+             "maxFPS": "60", "GxMaximize": "1", "GamePadEnable": "1",
+             "Sound_EnableAllSound": "1", "Sound_OutputDriverIndex": "0",
+             "Sound_OutputDriverName": "System Default"},
 }
 
 
@@ -100,44 +113,368 @@ def external_screens():
     return out
 
 
-def best_mode(connector):
-    """Highest-refresh 3840x2160 mode the TV offers (falls back to the largest mode)."""
-    r = run("gdctl", "show", "--modes")
-    block, modes = False, []
+LID_GLOB = "/proc/acpi/button/lid/*/state"
+CACHE = Path.home() / ".cache/couch"
+WOW_LAYOUT = CACHE / "layout-before-wow.json"   # exists = a WoW session holds the TV-only layout
+EXT_LAYOUT = CACHE / "layout-extended.json"     # last good lid-open layout (laptop + TV)
+LOCK = CACHE / "display.lock"
+TV_SCALE_FILE = CONF / "tv-scale"               # optional: TV-only scale (default 2 = 200%)
+TV_MAX_HZ_FILE = CONF / "tv-max-hz"             # TV refresh cap (default 60: the 3rd-gen
+                                                # HDMI card is HDMI 2.0b and goes black at 4K120)
+WOW_PROCS = ("Wow.exe", "WowClassic.exe", "Battle.net.exe")
+BNET_SESSION = Path.home() / ".cache/battlenet/wow-session"   # written by the battlenet launcher
+DRY = False                                     # --dry-run: gdctl --verify, nothing saved
+
+
+def lid_closed():
+    for st in Path("/").glob(LID_GLOB.lstrip("/")):
+        if "closed" in read(st):
+            return True
+    return False
+
+
+def tv_screen():
+    return next((s for s in external_screens() if s[3]), None)
+
+
+def drm_enabled(connector):
+    """True/False from /sys (cheap, no D-Bus), None if the connector isn't there."""
+    for f in Path("/sys/class/drm").glob(f"card*-{connector}/enabled"):
+        return read(f) == "enabled"
+    return None
+
+
+def monitor_modes():
+    """{connector: [mode, ...]} from `gdctl show --modes`."""
+    out, conn = {}, None
+    for line in run("gdctl", "show", "--modes", timeout=5).stdout.splitlines():
+        m = re.search(r"Monitor (\S+) ", line)
+        if m:
+            conn = m[1]
+            out[conn] = []
+            continue
+        m = re.search(r"\d+x\d+@[\d.]+(\+vrr)?", line)
+        if m and conn and "Logical monitor" not in line:
+            out[conn].append(m[0])
+    return out
+
+
+def current_layout():
+    """[{x, y, scale, primary, transform, monitors: [{connector, mode}]}] from `gdctl show`."""
+    r = run("gdctl", "show", timeout=5)
+    modes, lms, sect, conn, want_mode, lm = {}, [], None, None, False, None
     for line in r.stdout.splitlines():
-        if re.search(r"Monitor \S+", line):
-            block = f"Monitor {connector} " in line + " "
-        elif block:
-            m = re.search(r"(\d+)x(\d+)@([\d.]+)", line)
+        s = line.lstrip("│├└─ ")
+        if line.startswith("Monitors:"):
+            sect = "mon"
+        elif line.startswith("Logical monitors:"):
+            sect = "lm"
+        elif sect == "mon":
+            m = re.match(r"Monitor (\S+)", s)
             if m:
-                modes.append((int(m[1]), int(m[2]), float(m[3]), m[0]))
-    if not modes:
-        return None
-    uhd = [m for m in modes if m[0] == 3840 and m[1] == 2160]
-    pool = uhd or modes
-    return max(pool, key=lambda m: (m[0] * m[1], m[2]))[3]
+                conn, want_mode = m[1], False
+            elif s.startswith("Current mode"):
+                want_mode = True
+            elif want_mode:
+                m = re.match(r"\d+x\d+@[\d.]+(\+vrr)?", s)
+                if m and conn:
+                    modes[conn] = m[0]
+                want_mode = False
+        elif sect == "lm":
+            if s.startswith("Logical monitor"):
+                lm = {"x": 0, "y": 0, "scale": 1.0, "primary": False, "transform": "normal",
+                      "monitors": []}
+                lms.append(lm)
+            elif lm is None:
+                continue
+            elif s.startswith("Position:"):
+                lm["x"], lm["y"] = (int(v) for v in re.findall(r"-?\d+", s)[:2])
+            elif s.startswith("Scale:"):
+                lm["scale"] = float(s.split(":", 1)[1])
+            elif s.startswith("Transform:"):
+                lm["transform"] = s.split(":", 1)[1].strip()
+            elif s.startswith("Primary:"):
+                lm["primary"] = "yes" in s
+            elif not s.startswith("Monitors"):
+                m = re.match(r"(\S+) \(", s)
+                if m:
+                    lm["monitors"].append({"connector": m[1]})
+    for lm in lms:
+        for mon in lm["monitors"]:
+            mon["mode"] = modes.get(mon["connector"])
+    return lms
 
 
-def tv_display(connector):
-    mode = best_mode(connector)
-    cmd = ["gdctl", "set", "--logical-monitor", "--primary", "--scale", "2",
-           "--monitor", connector]
-    if mode:
-        cmd += ["--mode", mode]
-    r = run(*cmd)
-    return mode, r.returncode == 0, r.stderr.strip()
+def layout_key(layout):
+    return sorted((lm["x"], lm["y"], round(lm["scale"], 3), bool(lm["primary"]),
+                   lm.get("transform", "normal"),
+                   tuple(sorted((m["connector"], m.get("mode") or "") for m in lm["monitors"])))
+                  for lm in layout)
 
 
-def laptop_display():
+def layout_connectors(layout):
+    return {m["connector"] for lm in layout for m in lm["monitors"]}
+
+
+def layout_cmd(layout, verify=False):
+    cmd = ["gdctl", "set"] + (["--verify"] if verify else [])
+    for lm in layout:
+        cmd += ["--logical-monitor"] + (["--primary"] if lm["primary"] else [])
+        cmd += ["--scale", repr(float(lm["scale"])), "--x", str(lm["x"]), "--y", str(lm["y"])]
+        if lm.get("transform", "normal") != "normal":
+            cmd += ["--transform", lm["transform"]]
+        for mon in lm["monitors"]:
+            cmd += ["--monitor", mon["connector"]] + (["--mode", mon["mode"]] if mon.get("mode") else [])
+    return cmd
+
+
+def pick_modes(modes, res=None, max_hz=None):
+    """Best modes first: highest refresh (<= max_hz) at `res` (else the largest size);
+    60 Hz kept as fallback."""
+    parsed = []
+    for m in modes:
+        g = re.match(r"(\d+)x(\d+)@([\d.]+)", m)
+        if g and (max_hz is None or float(g[3]) <= max_hz + 0.5):
+            parsed.append((int(g[1]), int(g[2]), float(g[3]), "+vrr" in m, m))
+    pool = [p for p in parsed if f"{p[0]}x{p[1]}" == res] if res else []
+    if not pool and parsed:
+        big = max(p[0] * p[1] for p in parsed)
+        pool = [p for p in parsed if p[0] * p[1] == big]
+    pool.sort(key=lambda p: (p[2], p[3]), reverse=True)
+    out = [pool[0][4]] if pool else []
+    sixty = [p[4] for p in pool if round(p[2]) == 60]
+    if sixty and sixty[0] not in out:
+        out.append(sixty[0])               # fallback if the link can't carry the top refresh
+    return out or [None]
+
+
+def tv_max_hz():
+    try:
+        return float(read(TV_MAX_HZ_FILE, "60"))
+    except ValueError:
+        return 60.0
+
+
+def tv_scale():
+    try:
+        return float(read(TV_SCALE_FILE, "2"))
+    except ValueError:
+        return 2.0
+
+
+def tv_layouts(tv, modes):
+    """TV-only targets: TV primary at its best 4K mode, laptop panel off."""
+    return [[{"x": 0, "y": 0, "scale": tv_scale(), "primary": True, "transform": "normal",
+              "monitors": [{"connector": tv, "mode": m}]}]
+            for m in pick_modes(modes.get(tv, []), "3840x2160", tv_max_hz())]
+
+
+def extended_layouts(tv, modes):
+    """Lid-open targets: the last saved laptop+TV layout, else laptop primary with the TV to its right."""
+    out = []
+    try:
+        snap = json.loads(EXT_LAYOUT.read_text())
+        if layout_connectors(snap) == {LAPTOP_MODE[0], tv}:
+            out.append(snap)
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
     conn, res, scale = LAPTOP_MODE
-    r = run("gdctl", "show", "--modes")
-    mode = None
-    for m in re.findall(rf"{res}@[\d.]+", r.stdout):
-        if mode is None or float(m.split("@")[1]) > float(mode.split("@")[1]):
-            mode = m
-    cmd = ["gdctl", "set", "--logical-monitor", "--primary", "--scale", str(scale),
-           "--monitor", conn] + (["--mode", mode] if mode else [])
-    run(*cmd)
+    lap = pick_modes(modes.get(conn, []), res)[0]
+    tvm = pick_modes(modes.get(tv, []), "3840x2160", tv_max_hz())
+    width = int(res.split("x")[0])
+    for m in tvm:
+        out.append([{"x": 0, "y": 0, "scale": scale, "primary": True, "transform": "normal",
+                     "monitors": [{"connector": conn, "mode": lap}]},
+                    {"x": round(width / scale), "y": 0, "scale": 1.0, "primary": False,
+                     "transform": "normal", "monitors": [{"connector": tv, "mode": m}]}])
+    return out
+
+
+def apply_layout(candidates, label):
+    """Apply the first candidate mutter accepts (temporary config: no 'keep changes?' dialog,
+    nothing written to monitors.xml). Returns 'unchanged' | 'applied' | 'failed'."""
+    cur = current_layout()
+    if cur and any(layout_key(cur) == layout_key(c) for c in candidates[:1]):
+        return "unchanged"
+    for c in candidates:
+        cmd = layout_cmd(c, verify=DRY)
+        r = run(*cmd, timeout=10)
+        if DRY:
+            print(("ok  " if r.returncode == 0 else "BAD ") + " ".join(cmd))
+            if r.returncode != 0:
+                print("    " + (r.stderr or r.stdout).strip()[:200])
+        if r.returncode == 0:
+            return "verified" if DRY else "applied"
+    print(f"couch: {label} layout rejected by mutter", file=sys.stderr)
+    return "failed"
+
+
+def locked(fn):
+    """Serialize layout changes between the service and `couch wow-display` calls."""
+    import fcntl
+
+    def wrapper(*a, **kw):
+        CACHE.mkdir(parents=True, exist_ok=True)
+        with open(LOCK, "w") as fh:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX)
+            except OSError:
+                pass
+            return fn(*a, **kw)
+    return wrapper
+
+
+def desired_display(ignore_wow=False):
+    """('tv' | 'extended' | None, tv_connector). None = no TV, leave mutter alone."""
+    tv = tv_screen()
+    if not tv:
+        return None, None
+    if (WOW_LAYOUT.exists() and not ignore_wow) or lid_closed() or read(OVERRIDE, "auto") == "couch":
+        return "tv", tv[0]
+    return "extended", tv[0]
+
+
+@locked
+def ensure_display(kind, tv):
+    if not kind or not tv:
+        return "unchanged"
+    modes = monitor_modes()
+    if kind == "tv":
+        return apply_layout(tv_layouts(tv, modes), "TV-only")
+    cur = current_layout()
+    if LAPTOP_MODE[0] in layout_connectors(cur) and tv in layout_connectors(cur):
+        return "unchanged"                # laptop + TV already up: keep the user's arrangement
+    return apply_layout(extended_layouts(tv, modes), "extended")
+
+
+def save_extended_snapshot(layout=None):
+    """Remember the lid-open laptop+TV layout so closing/opening the lid or WoW can restore it."""
+    layout = layout or current_layout()
+    if DRY or not layout or LAPTOP_MODE[0] not in layout_connectors(layout) \
+            or len(layout_connectors(layout)) < 2:
+        return
+    CACHE.mkdir(parents=True, exist_ok=True)
+    EXT_LAYOUT.write_text(json.dumps(layout))
+
+
+def wow_running():
+    for c in Path("/proc").glob("[0-9]*/comm"):
+        if read(c) in WOW_PROCS:
+            return True
+    return False
+
+
+def session_active():
+    """A WoW/Battle.net session is running. Wine dies (X error BadRROutput) if mutter
+    reconfigures monitors under it, so nothing may change the layout meanwhile."""
+    return WOW_LAYOUT.exists() or BNET_SESSION.exists() or wow_running()
+
+
+def pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def wow_display(action, owner_pid=None):
+    """`couch wow-display start|stop`: TV-only while WoW runs, previous layout after.
+    Idempotent; always exit 0 (problems are printed, never fatal for the launcher)."""
+    if action == "start":
+        tv = tv_screen()
+        if not tv:
+            print("wow-display: no TV connected, layout left alone")
+            return 0
+        if not WOW_LAYOUT.exists():
+            data = {"time": time.time(), "pid": owner_pid or os.getppid(),
+                    "layout": current_layout()}
+            if DRY:
+                print("would save " + json.dumps(data["layout"]))
+            else:
+                CACHE.mkdir(parents=True, exist_ok=True)
+                save_extended_snapshot(data["layout"])
+                WOW_LAYOUT.write_text(json.dumps(data))
+        if wow_running():
+            print("wow-display start: Wine already running, layout left alone (would crash it)")
+            return 0
+        res = ensure_display("tv", tv[0])
+        print(f"wow-display start: {tv[1] or tv[0]} only ({res})")
+        return 0
+    if action == "stop":
+        try:
+            data = json.loads(WOW_LAYOUT.read_text())
+        except (OSError, ValueError):
+            print("wow-display stop: nothing saved, layout left alone")
+            return 0
+        if not DRY:
+            WOW_LAYOUT.unlink(missing_ok=True)
+        kind, tv = desired_display(ignore_wow=True)
+        saved = data.get("layout") or []
+        if kind == "extended" and LAPTOP_MODE[0] in layout_connectors(saved) \
+                and layout_connectors(saved) <= ({LAPTOP_MODE[0], tv}):
+            save_extended_snapshot(saved)        # restore exactly what was there before WoW
+        res = ensure_display(kind, tv) if kind else "unchanged"
+        print(f"wow-display stop: {kind or 'no TV'} ({res})")
+        return 0
+    print("usage: couch wow-display start|stop [--pid N] [--dry-run]")
+    return 0
+
+
+class DisplayWatch:
+    """Service side: lid closed or WoW running + TV => TV only; lid open => extended again.
+    Re-asserts TV-only if mutter reverts it (resume, TV hotplug blip) - checked via /sys, cheap.
+    Never touches the layout while a WoW session is active (see session_active)."""
+    SETTLE, RETRY, SNAP = 2.0, 10.0, 60.0
+
+    def __init__(self):
+        self.last = ("init",)
+        self.changed = self.applied = self.snapped = 0.0
+        self.pending, self.fails = True, 0
+
+    def tick(self):
+        now = time.monotonic()
+        self.reap_stale_wow(now)
+        if session_active():
+            # Hands off during a WoW session (lid changes included): the launcher owns the
+            # layout via wow-display start/stop. Re-evaluate from scratch once it's over.
+            self.last = ("session",)
+            return
+        kind, tv = desired_display()
+        if (kind, tv) != self.last:
+            self.last, self.changed, self.pending, self.fails = (kind, tv), now, True, 0
+            return
+        if not kind:
+            return
+        if self.pending and now - self.changed >= self.SETTLE:
+            self.pending = False
+            self.do(kind, tv, now)
+        elif kind == "tv" and drm_enabled(tv) and drm_enabled(LAPTOP_MODE[0]) \
+                and now - self.applied >= self.RETRY and self.fails < 3:
+            self.do(kind, tv, now)        # mutter put the laptop panel back while we want TV only
+        elif kind == "extended" and not self.pending and now - self.snapped >= self.SNAP \
+                and drm_enabled(LAPTOP_MODE[0]) and drm_enabled(tv):
+            self.snapped = now
+            save_extended_snapshot()
+
+    def do(self, kind, tv, now):
+        self.applied = now
+        res = ensure_display(kind, tv)
+        self.fails = self.fails + 1 if res == "failed" else 0
+        if res != "unchanged":
+            print(f"display: {kind} on {tv} -> {res}", flush=True)
+
+    def reap_stale_wow(self, now):
+        """A WoW session that ended without `wow-display stop` (crash, kill) gives the layout back."""
+        try:
+            data = json.loads(WOW_LAYOUT.read_text())
+        except (OSError, ValueError):
+            return
+        if time.time() - data.get("time", 0) < 90 or pid_alive(data.get("pid")) \
+                or wow_running() or BNET_SESSION.exists():
+            return
+        print("display: WoW session gone without stop, restoring", flush=True)
+        wow_display("stop")
 
 
 # ---- audio --------------------------------------------------------------------------
@@ -149,22 +486,66 @@ def pactl_json(*what):
         return []
 
 
+AUDIO = Path.home() / ".local/bin/audio"
+EE_SINK = "easyeffects_sink"
+
+
+def move_streams(sink):
+    """Move app streams to `sink`, skipping EasyEffects' own streams, combine_sink's internal
+    ones and anything already on the EasyEffects sink (moving those bypasses the EQ).
+    Same rule as move_streams in ~/.local/bin/audio."""
+    ee = {str(s["index"]) for s in pactl_json("sinks") if s.get("name") == EE_SINK}
+    for si in pactl_json("sink-inputs"):
+        props = si.get("properties", {})
+        tags = " ".join(str(props.get(k, "")) for k in
+                        ("node.name", "application.name", "application.id")).lower()
+        if str(si.get("sink")) in ee or "easyeffects" in tags or "output.combine_sink" in tags:
+            continue
+        run("pactl", "move-sink-input", str(si["index"]), sink)
+
+
+def audio_tv_sink():
+    """TV sink name from `audio wow tv` (owned by the audio script), or None."""
+    if not AUDIO.exists():
+        return None
+    name = run(str(AUDIO), "wow", "tv", timeout=5).stdout.strip().splitlines()
+    names = {s.get("name") for s in pactl_json("sinks")}
+    return name[-1] if name and name[-1] in names else None
+
+
+def hardware_sink(name):
+    """`name` if it is a real device sink; for EasyEffects / combine / other virtual sinks the
+    hardware sink EasyEffects plays to (if real), else None (then nothing gets saved)."""
+    sinks = {s.get("name"): s for s in pactl_json("sinks")}
+
+    def real(n):
+        props = sinks.get(n, {}).get("properties", {})
+        return n in sinks and n != EE_SINK and "combine" not in n and bool(props.get("device.api"))
+    if not name or real(name):
+        return name or None
+    out = run("gsettings", "get", "com.github.wwmm.easyeffects.streamoutputs",
+              "output-device").stdout.strip().strip("'")
+    return out if real(out) else None
+
+
 def tv_audio():
     for card in pactl_json("cards"):
         if any(p.get("available") and n == "HiFi" for n, p in card["profiles"].items()) \
                 and card["active_profile"] != "HiFi" and "c1_00.1" in card["name"]:
             run("pactl", "set-card-profile", card["name"], "HiFi")
             time.sleep(1)
+    preferred = audio_tv_sink()
     for sink in pactl_json("sinks"):
         ports = sink.get("ports", [])
         hdmi = "hdmi" in sink["name"].lower() or "c1_00.1" in sink["name"]
+        if preferred and sink["name"] != preferred:
+            continue
         if hdmi and any(p.get("availability") != "not available" for p in ports):
-            cur = run("pactl", "get-default-sink").stdout.strip()
+            cur = hardware_sink(run("pactl", "get-default-sink").stdout.strip())
             if cur and "c1_00.1" not in cur:
                 write(SAVED_SINK, cur)
             run("pactl", "set-default-sink", sink["name"])
-            for si in pactl_json("sink-inputs"):
-                run("pactl", "move-sink-input", str(si["index"]), sink["name"])
+            move_streams(sink["name"])
             return sink.get("description", sink["name"])
     return None
 
@@ -172,8 +553,7 @@ def tv_audio():
 def desk_audio():
     sink = read(SAVED_SINK)
     if sink and run("pactl", "set-default-sink", sink).returncode == 0:
-        for si in pactl_json("sink-inputs"):
-            run("pactl", "move-sink-input", str(si["index"]), sink)
+        move_streams(sink)
 
 
 # ---- profiles -----------------------------------------------------------------------
@@ -192,9 +572,11 @@ def apply(profile, tv, announce=True):
             tv = next((s for s in external_screens() if s[3]), None)
         msg = []
         if tv:
-            mode, ok, err = tv_display(tv[0])
-            msg.append(f"{tv[1] or tv[0]} at {mode or 'default mode'}"
-                       + ("" if ok else f" (display change failed: {err[:80]})"))
+            # Screens follow the lid / WoW / override rule (DisplayWatch), not the profile alone.
+            kind, conn = desired_display()
+            res = "unchanged" if session_active() else ensure_display(kind, conn)
+            msg.append(f"{tv[1] or tv[0]} " + ("only" if kind == "tv" else "next to the laptop")
+                       + (" (display change failed)" if res == "failed" else ""))
             snd = tv_audio()
             if snd:
                 msg.append("sound → TV")
@@ -206,10 +588,9 @@ def apply(profile, tv, announce=True):
             notify("Couch mode: " + ", ".join(msg or ["on (no TV detected)"]))
     else:
         if prev == "couch":
-            if not any(s[3] for s in external_screens()):
-                pass                      # TV unplugged: mutter already moved to what's left
-            else:
-                laptop_display()
+            kind, conn = desired_display()  # TV still plugged in: laptop + TV (lid open)
+            if kind and not session_active():                        # TV unplugged: mutter already moved to what's left
+                ensure_display(kind, conn)
             desk_audio()
             run(str(PAD), "off")
         write(CURRENT, "desk")
@@ -219,13 +600,19 @@ def apply(profile, tv, announce=True):
 
 def daemon():
     last = None
+    screens = DisplayWatch()
     while True:
+        try:
+            screens.tick()
+        except Exception as e:            # never let a display hiccup stop the profile service
+            print(f"display: {e!r}", flush=True)
         profile, tv = wanted_profile()
         key = (profile, tv[0] if tv else None)
         if key != last:
-            if last is not None or profile != read(CURRENT, "desk"):
-                time.sleep(2)             # let mutter finish its own hotplug reconfigure
-                apply(profile, tv)
+            time.sleep(2)                 # let mutter finish its own hotplug reconfigure
+            # At service start re-apply too (idempotent, quiet): after a reboot `current`
+            # still says couch but mutter/PipeWire came up with their defaults.
+            apply(profile, tv, announce=last is not None or profile != read(CURRENT, "desk"))
             last = key
         time.sleep(2)
 
@@ -286,13 +673,29 @@ def show():
     print(f"🛋  profile: {read(CURRENT, 'desk')}  (mode: {o})")
     for conn, name, width, tv in external_screens():
         print(f"   {conn}: {name or 'unknown'} {width} cm{'  ← TV' if tv else ''}")
+    kind, _ = desired_display()
+    lid = "closed" if lid_closed() else "open"
+    print(f"   lid {lid}; screens wanted: "
+          + {"tv": "TV only", "extended": "laptop + TV", None: "(no TV, GNOME decides)"}[kind]
+          + ("  [WoW session holds TV-only]" if WOW_LAYOUT.exists() else "")
+          + ("  [WoW/Battle.net running: layout frozen]" if session_active() else ""))
+    print(f"   TV-only: scale {tv_scale():g}, refresh cap {tv_max_hz():g} Hz "
+          f"({TV_MAX_HZ_FILE.name} in {CONF})")
+    for lm in current_layout():
+        mons = ", ".join(f"{m['connector']} {m.get('mode') or ''}" for m in lm["monitors"])
+        print(f"   {'*' if lm['primary'] else ' '} ({lm['x']},{lm['y']}) x{lm['scale']:.2f}  {mons}")
     svc = run("systemctl", "--user", "is-active", "couchmode").stdout.strip()
     if svc != "active":
         print(f"   service not running ({svc})")
 
 
 def main():
-    arg = sys.argv[1] if len(sys.argv) > 1 else "status"
+    global DRY
+    args = sys.argv[1:]
+    if "--dry-run" in args:
+        DRY = True
+        args.remove("--dry-run")
+    arg = args[0] if args else "status"
     if arg == "daemon":
         daemon()
     elif arg in ("on", "off", "auto"):
@@ -302,6 +705,16 @@ def main():
         show()
     elif arg == "wow-prep":
         wow_prep()
+    elif arg == "wow-display":
+        pid = args[args.index("--pid") + 1] if "--pid" in args[:-1] else None
+        try:
+            sys.exit(wow_display(args[1] if len(args) > 1 else "", pid))
+        except Exception as e:            # the launcher must never fail because of the screens
+            print(f"wow-display: {e!r}", file=sys.stderr)
+            sys.exit(0)
+    elif arg == "display":                # re-apply the lid/WoW screen rule now
+        kind, conn = desired_display()
+        print(f"display: {kind or 'no TV'} -> {ensure_display(kind, conn)}")
     elif arg == "status":
         show()
     else:

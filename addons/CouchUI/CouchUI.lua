@@ -245,7 +245,7 @@ end
 -- ---- Hunter macros (per character, only for spells this character actually has) ----
 local HUNTER = {
     { "PetAttack", nil, "/petattack [@mouseover,harm,nodead][]" },
-    { "PetSummon", "Mend Pet", "#showtooltip\n/cast [@pet,dead] Revive Pet; [nopet] Call Pet 1; Mend Pet" },
+    { "PetSummon", "Mend Pet", "#showtooltip\n/cast [@pet,dead] Revive Pet; [nopet] Call Pet; Mend Pet" },
     { "MisdTank", "Misdirection", "#showtooltip Misdirection\n/cast [@focus,help,nodead][@pet,exists,nodead] Misdirection" },
     { "TrapCursor", "Freezing Trap", "#showtooltip Freezing Trap\n/cast [@cursor] Freezing Trap" },
     { "MarkMO", "Hunter's Mark", "#showtooltip Hunter's Mark\n/cast [@mouseover,harm,nodead][] Hunter's Mark" },
@@ -276,6 +276,156 @@ local function makeClassMacros()
     if #skipped > 0 then say("not learned yet / not in Forever: " .. table.concat(skipped, ", ")) end
 end
 
+-- Forever's hunter has "Call Pet", not retail's "Call Pet 1": fix macros made before 2.3
+local function fixPetMacro()
+    local idx = GetMacroIndexByName("PetSummon")
+    if idx and idx > 0 then
+        local _, _, body = GetMacroInfo(idx)
+        if body and body:find("Call Pet 1", 1, true) then
+            pcall(EditMacro, idx, nil, nil, (body:gsub("Call Pet 1", "Call Pet")))
+        end
+    end
+end
+
+-- ---- Social wheel (couch): party / guild / inspect / trade on the controller ----------
+-- An Easy Controller mini wheel named "Social" on LT + RB (that combo was set to
+-- "nothing", so no button of yours moves). Hold LT + RB, aim with the right stick, let go.
+-- Every action uses your CURRENT target only (pick the player with LB / assist first);
+-- nothing is ever auto-targeted, so nothing goes to a stranger by accident. With no
+-- player targeted the game just says so. Whisper: Easy Controller's keyboard, /w - your
+-- target's name is offered first. /couch social = rebuild, /couch social off = remove.
+local SOCIAL_MACROS = {
+    { "SocInvite", "Spell_Holy_PrayerOfHealing", "/invite" },
+    { "SocInspect", "INV_Misc_Spyglass_02", "/inspect" },
+    { "SocGuild", "INV_Shirt_GuildTabard_01", "/ginvite" },
+    { "SocTrade", "INV_Misc_Coin_02",
+        "/run if UnitIsPlayer(\"target\") then InitiateTrade(\"target\") end" },
+    { "SocFollow", "Ability_Tracking", "/follow" },
+    { "SocFriend", "INV_ValentinesCard02", "/friend" },
+    { "Leave", 134400, "/leavegroup" },
+}
+local SOCIAL_RETIRED = { "SocTarget" }   -- 2.3's auto-target macro: removed
+local SOCIAL_BUTTON = { "RB", "LT" }   -- LT + RB
+local SOCIAL_FALLBACK = { "L3", "RT" } -- if LT + RB is taken by something of yours
+
+local function socialMacros()
+    for _, name in ipairs(SOCIAL_RETIRED) do
+        local idx = GetMacroIndexByName(name)
+        if idx and idx > 0 then pcall(DeleteMacro, idx) end
+    end
+    for _, m in ipairs(SOCIAL_MACROS) do
+        local idx = GetMacroIndexByName(m[1])
+        if idx == 0 then
+            if not pcall(CreateMacro, m[1], m[2], m[3], false) then
+                pcall(CreateMacro, m[1], 134400, m[3], false)
+            end
+        elseif m[1] ~= "Leave" then
+            -- ours: keep the body current (earlier versions auto-targeted)
+            local _, _, body = GetMacroInfo(idx)
+            if body ~= m[3] then pcall(EditMacro, idx, nil, nil, m[3]) end
+        end
+    end
+end
+
+local function ecSocial()
+    local ck = _G.ControllerKeyboard
+    if ck and ck.MyWheels and ck.Mapping and ck.db and ck.db.settings then
+        for _, w in ipairs(ck.MyWheels:List()) do
+            if w.couchSocial then return ck, w end
+        end
+        return ck
+    end
+end
+
+local function bindSocial(ck, id)
+    local M = ck.Mapping
+    for _, b in ipairs({ SOCIAL_BUTTON, SOCIAL_FALLBACK }) do
+        local input, layer = b[1], b[2]
+        local inp = M.BY_ID and M.BY_ID[input]
+        local cur = M:Get(input, layer)
+        local rep = M:GetReplaced(input, layer)
+        local action = "wheel:" .. id
+        if cur == action or rep == action then return input, layer end
+        -- only a button set to "nothing", or one with no function at all: never yours / the game's
+        if inp and not cur then
+            if rep == M.NOTHING and M:Replaceable(inp, layer) then
+                M:SetReplaced(input, layer, action); return input, layer
+            elseif rep == nil and M:State(inp, layer) == "free" then
+                M:Set(input, layer, action); return input, layer
+            end
+        end
+    end
+end
+
+local function setupSocial(verbose)
+    if InCombatLockdown() then return say("leave combat first") end
+    local ck, w = ecSocial()
+    if not ck then return end
+    socialMacros()
+    if not w then
+        local id = ck.MyWheels:Create()
+        if not id then return say("Social wheel: Easy Controller has no free wheel (8 max)") end
+        w = ck.MyWheels:Get(id)
+        w.couchSocial = true
+        CouchUIDB.socialBound = CouchUIDB.socialBound or {}
+        CouchUIDB.socialBound[UnitGUID("player") or "?"] = nil
+    end
+    w.name = "Social"
+    for i = 1, 8 do
+        local m = SOCIAL_MACROS[i]
+        w.slots[i] = m and ("macro:" .. m[1]) or nil
+    end
+    w.mini = true
+    CouchUIDB.socialBound = CouchUIDB.socialBound or {}
+    local key = UnitGUID("player") or "?"
+    local input, layer
+    if not CouchUIDB.socialBound[key] then
+        input, layer = bindSocial(ck, w.id)
+        CouchUIDB.socialBound[key] = true
+    else
+        input, layer = ck.MyWheels:Bound(w.id)
+    end
+    pcall(ck.MyWheels.UpdateBindingNames, ck.MyWheels)
+    pcall(ck.ConsumableWheel.Fill, ck.ConsumableWheel)
+    pcall(ck.Mapping.Apply, ck.Mapping)
+    if ck.Paddles then pcall(ck.Paddles.Apply, ck.Paddles) end
+    if verbose or input then
+        say("Social wheel" .. (input and (" on " .. (layer ~= "" and layer .. " + " or "") .. input) or
+            " ready (no free button - pick one in /ec map)") ..
+            ": invite, inspect, guild invite, trade, follow, add friend, leave group - on your target (LB).")
+    end
+end
+
+local function removeSocial()
+    local ck, w = ecSocial()
+    if not (ck and w) then return say("no Social wheel") end
+    if InCombatLockdown() then return say("leave combat first") end
+    pcall(ck.MyWheels.Delete, ck.MyWheels, w.id)
+    CouchUIDB.socialOff = true
+    say("Social wheel removed (/couch social to bring it back)")
+end
+
+-- Easy Controller's keyboard: offer the targeted player's name first for /w
+local function patchWhisperNames()
+    local ck = _G.ControllerKeyboard
+    if not (ck and type(ck.KnownNames) == "function") or ck.couchKnownNames then return end
+    local orig = ck.KnownNames
+    ck.KnownNames = function(self, ...)
+        local list = orig(self, ...)
+        local ok, name = pcall(function()
+            if UnitIsPlayer("target") and not UnitIsUnit("target", "player") then
+                return GetUnitName("target", true)
+            end
+        end)
+        if ok and type(name) == "string" and type(list) == "table" then
+            for i = #list, 1, -1 do if list[i] == name then table.remove(list, i) end end
+            table.insert(list, 1, name)
+        end
+        return list
+    end
+    ck.couchKnownNames = true
+end
+
 local function applyAll(quiet)
     if InCombatLockdown() then return say("leave combat first") end
     local p, name = prof()
@@ -288,7 +438,15 @@ local function applyAll(quiet)
     if guid and not CouchUIDB.classMacros[guid] then
         makeClassMacros(); CouchUIDB.classMacros[guid] = true
     end
+    fixPetMacro()
     if name == "Desk" and not CouchUIDB.bindsApplied then applyBinds() end
+    if name == "Couch" then
+        patchWhisperNames()
+        -- after Easy Controller and CouchWheels have set up this character's wheels
+        if not CouchUIDB.socialOff then
+            C_Timer.After(6, function() pcall(setupSocial, false) end)
+        end
+    end
     if not quiet then say(name .. " profile applied. /couch for options.") end
     CouchUIDB.arranged = CouchUIDB.arranged or {}
     local v = CouchUIDB.arranged[name]
@@ -299,9 +457,11 @@ local f = CreateFrame("Frame")
 f:RegisterEvent("PLAYER_LOGIN")
 f:SetScript("OnEvent", function()
     CouchUIDB = CouchUIDB or {}
-    -- Combat log feeds the Govee lights (govee-wow). /couch lights off to stop.
-    if CouchUIDB.combatLog ~= false and LoggingCombat and not LoggingCombat() then
-        pcall(LoggingCombat, true)
+    -- Combat log feeds the Govee lights (govee-wow), which only run on the TV (couch):
+    -- logged only there, so desk play doesn't fill Logs/. /couch lights off to stop.
+    if LoggingCombat then
+        local want = CouchUIDB.combatLog ~= false and profileName() == "Couch"
+        if want ~= (LoggingCombat() and true or false) then pcall(LoggingCombat, want) end
     end
     local last = CouchUIDB.lastProfile
     C_Timer.After(3, function()
@@ -331,8 +491,16 @@ SlashCmdList.COUCHUI = function(input)
         pcall(LoggingCombat, CouchUIDB.combatLog)
         say("Govee light sync (combat log) " .. (CouchUIDB.combatLog and "on" or "off"))
     elseif cmd == "binds" then if arg == "undo" then undoBinds() else applyBinds() end
+    elseif cmd == "social" then
+        if arg == "off" then removeSocial()
+        elseif not ecSocial() then say("Social wheel needs Easy Controller (couch mode)")
+        else
+            CouchUIDB.socialOff = nil
+            if arg == "rebind" then CouchUIDB.socialBound = {} end
+            setupSocial(true)
+        end
     else
         say("profile: " .. name .. " | font " .. p.font .. " | scale " .. tostring(p.scale or "default"))
-        say("/couch font 18 | /couch scale 0.9 | /couch scale off | /couch layout | /couch arrange [undo] | /couch macros | /couch binds [undo] | /couch lights on|off")
+        say("/couch font 18 | /couch scale 0.9 | /couch scale off | /couch layout | /couch arrange [undo] | /couch macros | /couch binds [undo] | /couch social [off|rebind] | /couch lights on|off")
     end
 end

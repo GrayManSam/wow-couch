@@ -1,0 +1,13 @@
+#!/bin/sh
+# Discover Overlay (Discord voice overlay) in X11 mode: GNOME has no wlr-layer-shell, and the
+# XWayland window can sit above XWayland games (WoW) and be click-through.
+#   discord-overlay          start it (no-op if running)
+#   discord-overlay settings open its settings window
+#   discord-overlay stop
+APP=io.github.trigg.discover_overlay
+case "$1" in
+  stop) flatpak kill $APP 2>/dev/null; exit 0 ;;
+  settings) exec flatpak run --env=GDK_BACKEND=x11 $APP --configure ;;
+esac
+flatpak ps --columns=application 2>/dev/null | grep -qx $APP && exit 0
+exec flatpak run --env=GDK_BACKEND=x11 $APP "$@"

@@ -1,0 +1,709 @@
+#!/usr/bin/env bash
+# audio speakers | headphones | up | down | status   (no argument = toggle)
+# audio wow start [--night|--day] [--dry-run] | stop [--dry-run] | status | tv
+#           | route [--wait SECONDS] | doctor [--no-tone]
+#   start:  TV sound + EasyEffects "WoW" preset (WoW-Night 23:00-07:00); stop: restore.
+#   route:  put WoW's own stream(s) on the TV chain (unmuted, 100%); the launcher runs it once
+#           the WoW window is up. doctor: print the chain WoW -> EasyEffects -> TV + test tone.
+#   TV sink volume during a WoW session: ~/.config/wow-audio/tv-volume (percent, default 100;
+#   HDMI carries a digital signal — the TV's own remote sets the loudness).
+# audio headset status | test | chat-only on|off | mute [on|off] | mirror tv|never | auto on|off
+#   headset in the Xbox controller jack -> sound on TV + headset, headset mic = default input
+#   (runs ~/.local/bin/xbox-headset; service xbox-headset.service does it automatically).
+#   While it is active, `audio wow` uses the "TV + Headset" output (xbox_tv_headset) instead of
+#   the bare TV sink.
+
+HP=combine_sink
+WOW_GAME=${WOW_DIR:-$HOME/Games/battlenet/drive_c/Program Files (x86)/World of Warcraft/_forever_}
+# Bluetooth audio devices to reconnect (one MAC per line): ~/.config/wow-audio/bt-devices
+mapfile -t BT_DEVICES < <(grep -Eo '^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' ~/.config/wow-audio/bt-devices 2>/dev/null)
+SPK=$(pactl list sinks short | awk '$2 ~ /^alsa_output.*Speaker/ {print $2; exit}')
+[ -z "$SPK" ] && SPK=$(pactl list sinks short | awk '$2 ~ /^alsa_output/ {print $2; exit}')
+PRESETS=~/.config/easyeffects/output
+MAX=150
+EE_SCHEMA=com.github.wwmm.easyeffects
+EE_OUT=com.github.wwmm.easyeffects.streamoutputs
+EE_SINK=easyeffects_sink
+HS_COMBO=xbox_tv_headset               # "TV + Headset" output of xbox-headset (controller jack)
+XH=~/.local/bin/xbox-headset
+WOW_DIR=~/.config/wow-audio
+WOW_STATE=$WOW_DIR/state
+# TV = an HDMI/DP ELD whose monitor name matches this (override: ~/.config/wow-audio/tv-name)
+TV_NAME_RE=${WOW_AUDIO_TV_RE:-TV|LG}
+[ -s "$WOW_DIR/tv-name" ] && TV_NAME_RE=$(head -n1 "$WOW_DIR/tv-name")
+# WirePlumber gives a never-adjusted HDMI sink 40% (device.routes.default-sink-volume 0.064 =
+# -24 dB). That plus WoW's own master volume made the TV practically silent, so a WoW session
+# sets the TV sink to this level.
+TV_VOL=100
+[ -s "$WOW_DIR/tv-volume" ] && TV_VOL=$(head -n1 "$WOW_DIR/tv-volume" | tr -dc 0-9)
+[ -z "$TV_VOL" ] && TV_VOL=100
+
+[ "$1" != wow ] && gsettings set $EE_OUT use-default-output-device true 2>/dev/null
+
+ee_running() { pgrep -x easyeffects >/dev/null; }
+
+ensure_ee() {
+  ee_running && return 0
+  # D-Bus activation runs it as its own unit (survives the launcher / Steam killing our tree)
+  gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+    --method org.freedesktop.DBus.StartServiceByName $EE_SCHEMA 0 >/dev/null 2>&1 \
+    || setsid -f easyeffects --gapplication-service >/dev/null 2>&1
+  for _ in $(seq 30); do            # ready when its virtual sink exists (max ~6 s)
+    pactl list sinks short 2>/dev/null | grep -q "	$EE_SINK	" && return 0
+    sleep 0.2
+  done
+  ee_running
+}
+
+load_preset() { [ -f "$PRESETS/$1.json" ] && ensure_ee && easyeffects -l "$1" 2>/dev/null; }
+
+move_apps() {
+  pgrep -x easyeffects >/dev/null && return
+  for id in $(pactl list sink-inputs | awk '
+    /^Sink Input #/ {id=substr($3,2); ids[++n]=id}
+    /node\.name|application\.(name|id)/ && tolower($0) ~ /easyeffects|output\.(combine_sink|xbox_tv_headset)/ {skip[id]=1}
+    END {for(i=1;i<=n;i++) if(!skip[ids[i]]) print ids[i]}'); do
+    pactl move-sink-input "$id" "$1" 2>/dev/null
+  done
+}
+
+cur_vol() { pactl get-sink-volume @DEFAULT_SINK@ | awk -F/ 'NR==1{gsub(/[ %]/,"",$2); print $2}'; }
+
+speakers() {
+  for c in $(aplay -l 2>/dev/null | awk '/^card/{gsub(":","",$2); print $2}' | sort -u); do
+    amixer -q -c "$c" sset Master 100% unmute 2>/dev/null
+    amixer -q -c "$c" sset Speaker 100% unmute 2>/dev/null
+  done
+  pactl set-sink-mute "$SPK" 0
+  pactl set-sink-volume "$SPK" 120%
+  pactl set-default-sink "$SPK"
+  move_apps "$SPK"
+  load_preset Laptop-Speakers
+  echo "🔊 Output: laptop speakers (120%, Laptop-Speakers preset)"
+}
+
+headphones() {
+  for d in "${BT_DEVICES[@]}"; do bluetoothctl connect "$d" >/dev/null 2>&1; done
+  sleep 3
+  for card in $(pactl list cards short | awk '/bluez_card/{print $2}'); do
+    pactl set-card-profile "$card" a2dp-sink 2>/dev/null
+  done
+  pactl set-sink-mute "$HP" 0
+  pactl set-sink-volume "$HP" 100%
+  pactl set-default-sink "$HP"
+  move_apps "$HP"
+  load_preset Movies-Podcasts-Music
+  echo "🎧 Output: both headphones"
+}
+
+up()   { v=$(( $(cur_vol) + 10 )); [ $v -gt $MAX ] && v=$MAX; pactl set-sink-volume @DEFAULT_SINK@ ${v}%; echo "Volume: ${v}%"; }
+down() { v=$(( $(cur_vol) - 10 )); [ $v -lt 0 ] && v=0;     pactl set-sink-volume @DEFAULT_SINK@ ${v}%; echo "Volume: ${v}%"; }
+
+status() {
+  echo "Default output: $(pactl get-default-sink)  —  volume $(cur_vol)%"
+  pactl list sinks short | awk '{print "  " $2 "  (" $NF ")"}'
+}
+
+# ---- WoW session audio ------------------------------------------------------------
+
+DRY=0
+run() { if [ $DRY = 1 ]; then echo "  would run: $*"; else "$@" >/dev/null 2>&1; fi; }
+
+# Prints the TV's sink name, or nothing. The TV is the HDMI/DP pin whose ELD monitor name
+# matches TV_NAME_RE. ELD pins (eld#C.N, sorted) map in order onto the card's HDMI PCMs
+# (3,7,8,9 -> HDMI1..4); that sink must also report its jack as plugged ("available").
+tv_sink() {
+  local card idx f name ok pcms pcm
+  for f in /proc/asound/card*/eld#*; do
+    [ -r "$f" ] || continue
+    grep -q '^monitor_present[[:space:]]*1' "$f" && grep -q '^eld_valid[[:space:]]*1' "$f" || continue
+    name=$(awk -F'\t+' '/^monitor_name/{print $2}' "$f")
+    printf '%s\n' "$name" | grep -Eqi "$TV_NAME_RE" || continue
+    card=${f#/proc/asound/card}; card=${card%%/*}
+    idx=$(ls /proc/asound/card"$card"/eld#* | sort -V | grep -nxF "$f" | cut -d: -f1)
+    mapfile -t pcms < <(awk -F'[-:]' -v c="$(printf '%02d' "$card")" '$1==c && /HDMI/ {print $2+0}' /proc/asound/pcm)
+    pcm=${pcms[$((idx-1))]}
+    ok=$(pactl list sinks 2>/dev/null | awk -v pcm="$pcm" '
+      /^Sink #/ {n=""; d=""; a=0}
+      /^\tName:/ {n=$2}
+      /alsa\.device = / {gsub(/"/,"",$3); d=$3}
+      /availability group: HDMI\/DP,pcm=/ && /, available\)/ {a=1}
+      /^\tFormats:/ {if (n ~ /HDMI/ && d==pcm && a) {print n; exit}}')
+    [ -n "$ok" ] && { echo "$ok"; return 0; }
+  done
+  # fallback: exactly one HDMI sink with a plugged jack, and some ELD named like a TV
+  ok=$(pactl list sinks 2>/dev/null | awk '
+    /^\tName:/ {n=$2}
+    /availability group: HDMI\/DP/ && /, available\)/ && n ~ /HDMI/ {print n}')
+  [ "$(printf '%s' "$ok" | grep -c .)" = 1 ] && grep -hs '^monitor_name' /proc/asound/card*/eld#* \
+    | grep -Eqi "$TV_NAME_RE" && echo "$ok"
+}
+
+ensure_hdmi_profile() {   # the HDMI sinks vanish if the card was left on profile "off"
+  pactl list sinks short | grep -q HDMI && return
+  local card
+  card=$(pactl list cards short | awk '$2 ~ /c1_00\.1/ {print $2; exit}')
+  [ -n "$card" ] && run pactl set-card-profile "$card" HiFi && [ $DRY = 0 ] && sleep 0.5
+}
+
+cur_preset() {
+  local p=""
+  ee_running && p=$(timeout 2 easyeffects -s output 2>/dev/null | tail -n1)
+  [ -z "$p" ] && p=$(gsettings get $EE_SCHEMA last-loaded-output-preset 2>/dev/null | tr -d "'")
+  echo "$p"
+}
+
+# Move every app stream that is not already on the EasyEffects sink (and is not EE's own
+# or combine_sink's internal stream) to $1. EasyEffects then pulls them into its chain.
+move_streams() {
+  local ee_idx
+  ee_idx=$(pactl list sinks short | awk -v s=$EE_SINK '$2==s {print $1}')
+  for id in $(pactl list sink-inputs 2>/dev/null | awk -v ee="$ee_idx" '
+    /^Sink Input #/ {id=substr($3,2); ids[++n]=id}
+    /^\tSink: / {if ($2==ee) skip[id]=1}
+    /node\.name|application\.(name|id)/ && tolower($0) ~ /easyeffects|output\.(combine_sink|xbox_tv_headset)/ {skip[id]=1}
+    END {for(i=1;i<=n;i++) if(!skip[ids[i]]) print ids[i]}'); do
+    run pactl move-sink-input "$id" "$1"
+  done
+}
+
+st() { grep -m1 "^$1=" "$WOW_STATE" 2>/dev/null | cut -d= -f2-; }
+
+# Where WoW's sound should go: the "TV + Headset" output while a controller headset is routed
+# (xbox-headset), else the TV sink itself ($1).
+out_sink() {
+  if [ -x "$XH" ] && "$XH" active && pactl list sinks short | grep -q "	$HS_COMBO	"; then
+    echo "$HS_COMBO"
+  else
+    echo "$1"
+  fi
+}
+
+wow_start() {
+  local tv preset=WoW h
+  h=$(date +%-H); { [ "$h" -ge 23 ] || [ "$h" -lt 7 ]; } && preset=WoW-Night
+  case " $* " in *" --night "*) preset=WoW-Night ;; *" --day "*) preset=WoW ;; esac
+
+  ensure_hdmi_profile
+  tv=$(tv_sink)
+  if [ -z "$tv" ]; then
+    echo "WoW audio: TV not connected — leaving audio as is"
+    return 0
+  fi
+  local out; out=$(out_sink "$tv")
+  echo "WoW audio: TV sink = $tv, preset = $preset$( [ "$out" != "$tv" ] && echo ", output = TV + controller headset")"
+  if [ -s "$WOW_STATE" ]; then
+    echo "  session already active (state kept from $(st started))"
+  elif [ $DRY = 1 ]; then
+    echo "  would save: sink=$(pactl get-default-sink) preset=$(cur_preset)" \
+         "ee_running=$(ee_running && echo 1 || echo 0) -> $WOW_STATE"
+  else
+    mkdir -p "$WOW_DIR"
+    {
+      echo "started=$(date -Is)"
+      echo "sink=$(pactl get-default-sink)"
+      echo "preset=$(cur_preset)"
+      echo "ee_running=$(ee_running && echo 1 || echo 0)"
+      echo "use_default=$(gsettings get $EE_OUT use-default-output-device 2>/dev/null)"
+      echo "output_device=$(gsettings get $EE_OUT output-device 2>/dev/null)"
+    } >"$WOW_STATE.tmp" && mv "$WOW_STATE.tmp" "$WOW_STATE"
+  fi
+  run pactl set-default-sink "$out"
+  tv_levels "$tv"
+  move_streams "$out"
+  run gsettings set $EE_OUT use-default-output-device true
+  run gsettings set $EE_OUT output-device "$out"
+  if [ ! -f "$PRESETS/$preset.json" ]; then
+    echo "  preset $preset missing in $PRESETS — sound moved, no EQ"
+  elif [ $DRY = 1 ]; then
+    echo "  would run: start EasyEffects service (D-Bus) + easyeffects -l $preset"
+  elif ensure_ee; then
+    easyeffects -l "$preset" >/dev/null 2>&1 || echo "  easyeffects -l $preset failed"
+  else
+    echo "  EasyEffects did not start — sound on TV without EQ"
+  fi
+  echo "  TV sink: unmuted, volume ${TV_VOL}%"
+  return 0
+}
+
+# TV pins as "CARD IDX" (IDX = 1-based position among the card's ELD pins = IEC958 index+1)
+tv_pins() {
+  local f card
+  for f in /proc/asound/card*/eld#*; do
+    [ -r "$f" ] || continue
+    grep -q '^monitor_present[[:space:]]*1' "$f" || continue
+    awk -F'\t+' '/^monitor_name/{print $2}' "$f" | grep -Eqi "$TV_NAME_RE" || continue
+    card=${f#/proc/asound/card}; card=${card%%/*}
+    echo "$card $(ls /proc/asound/card"$card"/eld#* | sort -V | grep -nxF "$f" | cut -d: -f1)"
+  done
+}
+
+# Unmute + set the TV sink level, and make sure the ALSA "IEC958 Playback Switch" of the TV's
+# pin is on (that switch IS the HDMI mute at the hardware level).
+tv_levels() {
+  local card idx
+  run pactl set-sink-mute "$1" 0
+  run pactl set-sink-volume "$1" "${TV_VOL}%"
+  while read -r card idx; do
+    [ -n "$idx" ] || continue
+    run amixer -q -c "$card" cset "iface=MIXER,name=IEC958 Playback Switch,index=$((idx-1))" on
+  done < <(tv_pins)
+}
+
+PYHELP=$(cat <<'PY'
+import json, math, os, re, subprocess, sys, wave
+from pathlib import Path
+
+WOW_RE = re.compile(r"(?i)^(wow(voiceproxy)?(\.exe)?|world of warcraft)$")
+EE_SINK = os.environ.get("EE_SINK", "easyeffects_sink")
+COMBO = "xbox_tv_headset"     # xbox-headset's "TV + Headset" output (contains the TV sink)
+
+def sh(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return ""
+
+def pj(what):
+    try:
+        return json.loads(sh("pactl", "-f", "json", "list", what) or "[]")
+    except ValueError:
+        return []
+
+def is_wow(props):
+    return any(WOW_RE.match(props.get(k, "") or "") for k in
+               ("application.name", "application.process.binary"))
+
+def vol(obj):
+    v = list((obj.get("volume") or {}).values())
+    if not v:
+        return "?", "?"
+    return v[0].get("value_percent", "?"), v[0].get("db", "?")
+
+def ee_outputs():
+    """Sinks the EasyEffects output chain feeds (from pw-link -l)."""
+    out, cur = set(), None
+    for line in sh("pw-link", "-l").splitlines():
+        if not line.startswith(" "):
+            cur = line.split(":")[0]
+        elif "|->" in line and cur and cur.startswith("ee_soe_"):
+            dst = line.split("|->", 1)[1].strip().split(":")[0]
+            if not dst.startswith("ee_"):
+                out.add(dst)
+    return out
+
+def streams():
+    sinks = {s["index"]: s["name"] for s in pj("sinks")}
+    for si in pj("sink-inputs"):
+        p = si.get("properties", {})
+        if is_wow(p):
+            print("\t".join([str(si["index"]), sinks.get(si.get("sink"), "?"),
+                             vol(si)[0].rstrip("%"), "yes" if si.get("mute") else "no",
+                             "yes" if si.get("corked") else "no",
+                             p.get("application.name", "?")]))
+
+def level(path):
+    """Loudest 100 ms RMS of a 16-bit wav, in dBFS."""
+    try:
+        w = wave.open(path)
+        n, ch = w.getnframes(), w.getnchannels()
+        data = memoryview(w.readframes(n)).cast("h")
+    except Exception:
+        return float("-inf")
+    win, best = 4800 * ch, 0.0
+    for i in range(0, max(len(data) - win, 1), win):
+        seg = data[i:i + win]
+        if len(seg):
+            best = max(best, math.sqrt(sum(x * x for x in seg) / len(seg)))
+    return 20 * math.log10(best / 32768) if best > 0 else float("-inf")
+
+def tone(path):
+    rate, frames = 48000, bytearray()
+    amp = 0.25 * 32767 * float(os.environ.get("AUDIO_DOCTOR_GAIN", "1"))   # <1 only for silent self-tests
+    def add(sec, hz):
+        for i in range(int(rate * sec)):
+            env = min(1.0, i / 480, (rate * sec - i) / 480)       # 10 ms fades, no clicks
+            s = int(amp * env * math.sin(2 * math.pi * hz * i / rate)) if hz else 0
+            frames.extend(s.to_bytes(2, "little", signed=True) * 2)
+    add(0.3, 0)
+    for hz in (440, 660, 880):
+        add(0.4, hz); add(0.25, 0)
+    w = wave.open(path, "wb"); w.setnchannels(2); w.setsampwidth(2); w.setframerate(rate)
+    w.writeframes(bytes(frames)); w.close()
+
+def cvars(cfg):
+    out = {}
+    try:
+        for line in cfg.read_bytes().decode("utf-8", "replace").splitlines():
+            m = re.match(r'SET (\S+) "(.*)"', line.strip())
+            if m:
+                out[m.group(1)] = m.group(2)
+    except OSError:
+        pass
+    return out
+
+def doctor(tv, game, pins=""):
+    probs = []
+    def ok(msg, fix=""): print(f"   ok  {msg}")
+    def bad(msg, fix=""):
+        print(f"   !!  {msg}" + (f"\n       fix: {fix}" if fix else "")); probs.append(msg)
+    def info(msg): print(f"       {msg}")
+
+    print("1. TV (HDMI ELD)")
+    found = False
+    for f in sorted(Path("/proc/asound").glob("card*/eld#*")):
+        t = f.read_text(errors="replace")
+        g = lambda k: (re.search(rf"^{k}\s+(.*)$", t, re.M) or [None, ""])[1].strip()
+        if g("monitor_present") != "1":
+            continue
+        found = True
+        sads = re.findall(r"^sad\d_coding_type\s+\[\S+\]\s+(.*)$", t, re.M)
+        info(f"{f.parent.name}/{f.name}: {g('monitor_name') or '?'} via {g('connection_type')}"
+             f", eld_valid {g('eld_valid')}, formats: {', '.join(sads) or 'none'}")
+        if any("TrueHD" in s or "MLP" in s for s in sads):
+            info("(TV lists TrueHD/8ch: often a sign of eARC passthrough to a soundbar/receiver —"
+                 " if one is attached, the sound goes THERE, not to the TV speakers)")
+    if not found:
+        bad("no HDMI/DP monitor with audio detected", "plug in the TV; check the cable/adapter")
+    cards = [c for c in pj("cards") if "c1_00.1" in c["name"] or "hdmi" in c["name"].lower()]
+    for c in cards:
+        (ok if c.get("active_profile") != "off" else bad)(f"card {c['name']} profile: {c.get('active_profile')}")
+
+    print("2. TV sink")
+    sinks = {s["name"]: s for s in pj("sinks")}
+    s = sinks.get(tv)
+    if not tv or not s:
+        bad("TV sink not found (audio wow tv printed nothing)",
+            "TV on + this input selected; `audio wow tv`; HDMI card profile HiFi")
+    else:
+        p, db = vol(s)
+        info(f"{tv}  ({s.get('properties', {}).get('node.nick', '')}) state {s.get('state')}")
+        (bad if s.get("mute") else ok)(f"muted: {'yes' if s.get('mute') else 'no'}",
+                                       "audio wow route (unmutes)")
+        try:
+            pct = int(p.rstrip("%"))
+        except ValueError:
+            pct = 0
+        (ok if pct >= 80 else bad)(f"volume {p} ({db})", "audio wow route (sets ~/.config/wow-audio/tv-volume, default 100%)")
+        port = next((x for x in s.get("ports", []) if x.get("name") == s.get("active_port")), {})
+        (ok if port.get("availability") != "not available" else bad)(
+            f"port {s.get('active_port')}: {port.get('availability', '?')}")
+        routes = Path.home() / ".local/state/wireplumber/default-routes"
+        port_name = (s.get("active_port") or "").replace("[Out] ", "")
+        saved = [l for l in routes.read_text().splitlines() if f"\\s{port_name}=" in l or f"{port_name}=" in l] \
+            if routes.exists() and port_name else []
+        info("WirePlumber saved level: " + (saved[0].split("=", 1)[1][:90] if saved else
+             "none (new routes start at 40% = -24 dB)"))
+
+    print("3. Default sink:", sh("pactl", "get-default-sink").strip())
+    if sh("pactl", "get-default-sink").strip() == COMBO:
+        info("(controller headset active: default = TV + Headset, which includes the TV)")
+    if tv and sh("pactl", "get-default-sink").strip() not in (tv, EE_SINK, COMBO):
+        bad("default sink is not the TV", "audio wow start / audio wow route")
+
+    print("4. EasyEffects")
+    ee_on = bool(sh("pgrep", "-x", "easyeffects").strip())
+    if not ee_on:
+        info("not running (WoW should then play straight to the TV sink)")
+    else:
+        gs = lambda k, schema="com.github.wwmm.easyeffects": sh("gsettings", "get", schema, k).strip()
+        info(f"running; preset {gs('last-loaded-output-preset')}, bypass {gs('bypass')}, "
+             f"process-all-outputs {gs('process-all-outputs')}")
+        info(f"output-device {gs('output-device', 'com.github.wwmm.easyeffects.streamoutputs')}"
+             f", use-default {gs('use-default-output-device', 'com.github.wwmm.easyeffects.streamoutputs')}")
+        es = sinks.get(EE_SINK)
+        if es:
+            (bad if es.get("mute") else ok)(f"{EE_SINK} muted: {'yes' if es.get('mute') else 'no'}, volume {vol(es)[0]}")
+        outs = ee_outputs()
+        if tv and (tv in outs or COMBO in outs):
+            ok(f"EasyEffects output -> {', '.join(sorted(outs))}")
+        else:
+            bad(f"EasyEffects output -> {', '.join(sorted(outs)) or 'NOTHING'} (not the TV)",
+                "audio wow route (re-points EasyEffects, or stops it so WoW plays direct)")
+
+    print("5. WoW")
+    wow_pid = sh("pgrep", "-x", "Wow.exe").split()
+    clients = [c for c in pj("clients") if is_wow(c.get("properties", {}))]
+    info(f"Wow.exe {'running (pid ' + ' '.join(wow_pid) + ')' if wow_pid else 'not running'}"
+         f"; PipeWire clients: {len(clients)}")
+    wstreams = [si for si in pj("sink-inputs") if is_wow(si.get("properties", {}))]
+    idx2name = {v["index"]: k for k, v in sinks.items()}
+    for si in wstreams:
+        sink = idx2name.get(si.get("sink"), "?")
+        chain = sink
+        if sink == EE_SINK:
+            chain = f"{EE_SINK} -> EasyEffects -> {', '.join(sorted(ee_outputs())) or 'NOTHING'}"
+        info(f"stream #{si['index']} {si['properties'].get('application.name')}: -> {chain}")
+        try:
+            low = int(vol(si)[0].rstrip("%")) < 80
+        except ValueError:
+            low = False
+        (bad if si.get("mute") or low else ok)(f"stream muted: {'yes' if si.get('mute') else 'no'}, volume {vol(si)[0]}"
+                                        f"{', corked (paused)' if si.get('corked') else ''}", "audio wow route")
+        if sink not in (tv, EE_SINK, COMBO):
+            bad(f"stream plays to {sink}, not the TV chain", "audio wow route")
+        elif sink == EE_SINK and not ({tv, COMBO} & ee_outputs()):
+            bad("stream goes into EasyEffects, whose output is not the TV", "audio wow route")
+        else:
+            ok("stream reaches the TV sink")
+    if wow_pid and not wstreams:
+        bad("WoW is running but has NO audio stream",
+            "in-game: System > Sound > Enable Sound + Output Device 'System Default'; "
+            "see Logs/Sound.log below; restart WoW after `audio wow start`")
+    sp = Path.home() / ".local/state/wireplumber/stream-properties"
+    if sp.exists():
+        for l in sp.read_text().splitlines():
+            if re.match(r"Output/Audio:application\.name:(Wow\.exe|World\\sof\\sWarcraft)=", l):
+                d = json.loads(l.split("=", 1)[1])
+                (bad if d.get("mute") or d.get("volume", 1) < 0.5 or d.get("target") else ok)(
+                    f"WirePlumber remembers {l.split(':', 2)[2].split('=')[0]}: volume "
+                    f"{d.get('volume')}, mute {d.get('mute')}, target {d.get('target', 'none (follows default)')}",
+                    "audio wow route fixes the live stream; WirePlumber then saves it")
+
+    print("6. WoW sound settings (Config.wtf / Logs/Sound.log)")
+    cv = cvars(Path(game) / "WTF/Config.wtf")
+    def c(k, d): return cv.get(k, d + " (default)")
+    info(f"Sound_EnableAllSound {c('Sound_EnableAllSound', '1')}, Sound_MasterVolume "
+         f"{c('Sound_MasterVolume', '1.0')}, SoundWhenGameIsInBG {c('Sound_EnableSoundWhenGameIsInBG', '0')}"
+         f", OutputDriverIndex {c('Sound_OutputDriverIndex', '0')}, OutputDriverName "
+         f"{c('Sound_OutputDriverName', 'System Default')}")
+    if cv.get("Sound_EnableAllSound") == "0":
+        bad("WoW sound is switched off (Sound_EnableAllSound 0)", "couch wow-prep sets it to 1")
+    if cv.get("Sound_OutputDriverIndex", "0") != "0":
+        bad("WoW is pinned to a specific output device, not System Default",
+            "couch wow-prep sets Sound_OutputDriverIndex 0 before the next launch")
+    if cv.get("Sound_EnableSoundWhenGameIsInBG", "0") == "0":
+        info("note: WoW goes SILENT whenever its window loses focus (Sound in Background off);"
+             " couch mode turns it on")
+    try:
+        mv = float(cv.get("Sound_MasterVolume", "1"))
+        if mv < 0.3:
+            bad(f"WoW master volume is low ({mv})", "in-game Sound > Master Volume")
+    except ValueError:
+        pass
+    log = Path(game) / "Logs/Sound.log"
+    if log.exists():
+        lines = log.read_text(errors="replace").replace("\r", "").splitlines()
+        for l in lines:
+            if "Using Driver" in l or "Output drivers detected" in l or "FAILED" in l.upper():
+                info(l.strip())
+        if lines and "Shutting Down SE3 COMPLETE" in lines[-1] and wow_pid:
+            bad("WoW's sound engine has shut down although Wow.exe is still alive (hung exit?)",
+                "close WoW fully (`battlenet --kill`) and start it again")
+
+    print("7. HDMI hardware switch (ALSA IEC958 Playback Switch = the HDMI pin's mute)")
+    for pin in filter(None, pins.split(",")):
+        card, idx = pin.split(":")
+        out = sh("amixer", "-c", card, "cget",
+                 f"iface=MIXER,name=IEC958 Playback Switch,index={int(idx) - 1}")
+        m = re.search(r": values=(\w+)", out)
+        (ok if m and m.group(1) == "on" else bad)(
+            f"card {card} pin {idx}: {m.group(1) if m else 'unknown'}", "audio wow route")
+
+    print()
+    if probs:
+        print(f"Found {len(probs)} problem(s) on this computer — see the !! lines above.")
+    else:
+        print("No problem found on this computer's side.")
+    return 1 if probs else 0
+
+cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+if cmd == "streams":
+    streams()
+elif cmd == "eeout":
+    print("\n".join(sorted(ee_outputs())))
+elif cmd == "level":
+    print(f"{level(sys.argv[2]):.1f}")
+elif cmd == "tone":
+    tone(sys.argv[2])
+elif cmd == "doctor":
+    sys.exit(doctor(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else ""))
+PY
+)
+py() { EE_SINK=$EE_SINK AUDIO_DOCTOR_GAIN=${AUDIO_DOCTOR_GAIN:-1} python3 -I -u -c "$PYHELP" "$@"; }
+
+ee_chain_ok() { ee_running && py eeout | grep -qxF "$1"; }
+
+# Put WoW's stream(s) on the TV chain: EasyEffects sink if its output really reaches the TV,
+# otherwise straight to the TV sink (EasyEffects is stopped then; sound without EQ beats none).
+wow_route() {
+  local wait=0 tv target t0=$SECONDS id sink v mute corked app streams=()
+  [ "$1" = --wait ] && wait=${2:-60}
+  [[ "$wait" =~ ^[0-9]+$ ]] || wait=60
+  while :; do
+    mapfile -t streams < <(py streams)
+    [ ${#streams[@]} -gt 0 ] && break
+    if (( SECONDS - t0 >= wait )); then
+      echo "WoW audio route: no WoW audio stream (WoW not running, still loading, or its sound is off)"
+      break
+    fi
+    sleep 2
+  done
+  tv=$(tv_sink)
+  if [ -z "$tv" ]; then
+    echo "WoW audio route: TV not connected — nothing to do"
+    return 0
+  fi
+  tv_levels "$tv"
+  local out; out=$(out_sink "$tv")
+  [ "$out" != "$tv" ] && echo "  controller headset active — WoW plays on TV + headset ($out)"
+  [ "$(pactl get-default-sink)" != "$out" ] && run pactl set-default-sink "$out"
+  target=$out
+  if ee_running; then
+    if ! ee_chain_ok "$out"; then
+      echo "  EasyEffects output was not on the TV — re-pointing it"
+      run gsettings set $EE_OUT output-device "$out"
+      run gsettings set $EE_OUT use-default-output-device true
+      [ $DRY = 0 ] && sleep 1.5
+    fi
+    if [ $DRY = 1 ] || ee_chain_ok "$out"; then
+      target=$EE_SINK
+    else
+      echo "  EasyEffects still not reaching the TV — stopping it, WoW plays straight to the TV"
+      run easyeffects -q
+      [ $DRY = 0 ] && sleep 1
+    fi
+  fi
+  echo "WoW audio route: TV sink $tv (${TV_VOL}%, unmuted), target $target"
+  for s in "${streams[@]}"; do
+    IFS=$'\t' read -r id sink v mute corked app <<<"$s"
+    run pactl set-sink-input-mute "$id" 0
+    run pactl set-sink-input-volume "$id" 100%
+    [ "$sink" != "$target" ] && run pactl move-sink-input "$id" "$target"
+    echo "  stream #$id ($app): ${sink} -> $target, volume ${v}% -> 100%, muted $mute -> no"
+  done
+  return 0
+}
+
+wow_doctor() {
+  local tv card idx sw tmp tone rec lvl sink_db hear streams=() wire_sink=""
+  echo "=== audio wow doctor  ($(date '+%F %T'))"
+  ensure_hdmi_profile
+  tv=$(tv_sink)
+  py doctor "$tv" "$WOW_GAME" "$(tv_pins | tr ' ' : | paste -sd,)"
+  case " $* " in *" --no-tone "*) return 0 ;; esac
+  if [ -z "$tv" ]; then echo "(no TV sink — skipping the test tone)"; return 0; fi
+
+  echo "8. Test tone: 3 rising beeps, played the way WoW plays (default output -> EasyEffects -> TV)"
+  tmp=$(mktemp -d); tone=$tmp/tone.wav; rec=$tmp/rec.wav
+  py tone "$tone"
+  pw-record -P '{ stream.capture.sink = true node.name = "audio-doctor-rec" }' --target "$tv" \
+    --format s16 --rate 48000 --channels 2 "$rec" >/dev/null 2>&1 &
+  local recpid=$!
+  sleep 0.3
+  pw-play --media-role Game -P '{ application.name = "audio-doctor" }' "$tone" >/dev/null 2>&1 &
+  local playpid=$!
+  for _ in 1 2 3 4 5; do   # force 100% on the test stream (role/app volumes may be restored low)
+    sleep 0.1
+    id=$(pactl -f json list sink-inputs 2>/dev/null | python3 -I -c '
+import json,sys
+for s in json.load(sys.stdin):
+    if s["properties"].get("application.name")=="audio-doctor": print(s["index"], s["sink"])' | head -n1)
+    [ -n "$id" ] && break
+  done
+  if [ -n "$id" ]; then
+    pactl set-sink-input-volume "${id%% *}" 100% 2>/dev/null
+    wire_sink=$(pactl list sinks short | awk -v i="${id##* }" '$1==i{print $2}')
+  fi
+  wait $playpid; sleep 0.3; kill $recpid 2>/dev/null; wait $recpid 2>/dev/null
+  lvl=$(py level "$rec")
+  sink_db=$(pactl get-sink-volume "$tv" | grep -o -m1 '[0-9]*% / [-0-9.inf]* dB' | head -n1)
+  echo "   test stream went to: ${wire_sink:-?}$( [ "$wire_sink" = "$EE_SINK" ] && echo " -> EasyEffects -> $(py eeout | paste -sd, -)")"
+  echo "   signal measured at the TV sink: ${lvl} dBFS (tone is -15 dBFS), then TV sink volume ${sink_db}"
+  if [ "$lvl" = -inf ] || awk -v l="$lvl" 'BEGIN{exit !(l < -40)}'; then
+    echo "   !!  almost no signal reached the TV sink — the problem is on this computer (see !! above)"
+  else
+    echo "   ok  the tone reached the HDMI output"
+  fi
+  rm -rf "$tmp"
+  if [ -t 0 ]; then
+    read -r -p "   Did you hear 3 rising beeps from the TV? [y/n] " hear
+    case "$hear" in
+      y*|Y*) echo "   TV path works. If WoW is still silent: check the WoW lines in 5./6. above;" \
+                  "in-game Sound > Output Device = System Default, Enable Sound on." ;;
+      *)     echo "   The computer sent sound to HDMI but the TV did not play it. Check on the TV:"
+             tv_checklist ;;
+    esac
+  else
+    echo "   If you did NOT hear it from the TV, check on the TV:"; tv_checklist
+  fi
+}
+
+tv_checklist() {
+  cat <<'EOF'
+     - TV volume up and not muted (remote: Mute / Vol +).
+     - Settings > Sound > Sound Out = "TV Speaker" (not Bluetooth, Optical, HDMI ARC/eARC soundbar,
+       or "Wired headphones"). If a soundbar/receiver is attached, it must be on and on TV/ARC input.
+     - The TV input the laptop is plugged into is the selected input (picture alone does not
+       prove sound: try another HDMI port/cable if everything else checks out).
+     - Settings > Sound > Advanced > Digital Sound Out: "Auto" or "PCM" (the laptop sends PCM).
+     - Unplug the HDMI cable for 10 s and plug it back in, then run `audio wow doctor` again.
+EOF
+}
+
+wow_stop() {
+  if [ ! -s "$WOW_STATE" ]; then
+    echo "WoW audio: no active session — nothing to restore"
+    return 0
+  fi
+  local sink preset
+  sink=$(st sink); preset=$(st preset)
+  if [ -n "$sink" ] && pactl list sinks short | awk '{print $2}' | grep -qxF "$sink"; then
+    run pactl set-default-sink "$sink"
+    move_streams "$sink"
+    echo "WoW audio: restored output $sink"
+  else
+    echo "WoW audio: previous output ${sink:-?} is gone — leaving default as is"
+  fi
+  [ -n "$(st use_default)" ] && run gsettings set $EE_OUT use-default-output-device "$(st use_default)"
+  [ -n "$(st output_device)" ] && run gsettings set $EE_OUT output-device "$(st output_device)"
+  if [ "$(st ee_running)" = 0 ]; then
+    ee_running && run easyeffects -q
+    echo "  EasyEffects stopped (it was off before)"
+  elif [ -n "$preset" ] && [ -f "$PRESETS/$preset.json" ]; then
+    ee_running && run easyeffects -l "$preset"
+    echo "  preset restored: $preset"
+  fi
+  if [ $DRY = 1 ]; then echo "  would remove $WOW_STATE"; else rm -f "$WOW_STATE"; fi
+  # controller headset still plugged in -> put TV + headset / headset mic back on top
+  [ $DRY = 0 ] && [ -x "$XH" ] && "$XH" active && "$XH" apply >/dev/null 2>&1 \
+    && echo "  controller headset routing re-applied"
+  return 0
+}
+
+wow_status() {
+  local tv; tv=$(tv_sink)
+  echo "TV sink: ${tv:-not connected}"
+  echo "Default: $(pactl get-default-sink)   EasyEffects: $(ee_running && echo "running, preset $(cur_preset)" || echo off)"
+  if [ -s "$WOW_STATE" ]; then echo "WoW session active:"; sed 's/^/  /' "$WOW_STATE"
+  else echo "No WoW session active"; fi
+}
+
+wow() {
+  local sub=$1; shift
+  case " $* " in *" --dry-run "*|*" -n "*) DRY=1 ;; esac
+  case "$sub" in
+    start)  wow_start "$@" ;;
+    stop)   wow_stop ;;
+    status) wow_status ;;
+    tv)     tv_sink ;;
+    route)  wow_route "$@" ;;
+    doctor) wow_doctor "$@" ;;
+    *)      echo "Usage: audio wow start [--night|--day] [--dry-run] | stop [--dry-run] | status | tv"
+            echo "                 | route [--wait SECONDS] [--dry-run] | doctor [--no-tone]" ;;
+  esac
+  return 0
+}
+
+case "$1" in
+  speakers|s)   speakers ;;
+  headphones|h) headphones ;;
+  up|+)         up ;;
+  down|-)       down ;;
+  status)       status ;;
+  wow)          shift; wow "$@"; exit 0 ;;
+  headset|hs)   shift; exec "$XH" "${@:-status}" ;;
+  "")           if [ "$(pactl get-default-sink)" = "$HP" ]; then speakers; else headphones; fi ;;
+  *)            echo "Usage: audio [speakers|headphones|up|down|status] | audio wow start|stop|status|route|doctor"
+                echo "       audio headset status|test|chat-only on|off|mute [on|off]|mirror tv|never|auto on|off" ;;
+esac

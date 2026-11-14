@@ -1,0 +1,497 @@
+#!/usr/bin/python3 -I
+"""discord-voice - join/leave a Discord voice channel from the couch (local Discord RPC).
+
+  discord-voice join | leave | toggle     General voice in your server (~/.config/discord-voice/server)
+  discord-voice mute | deafen             toggle self mute / deafen
+  discord-voice status                    who is in your voice channel
+  discord-voice setup                     one time: app client ID + secret, then Authorize
+  discord-voice authorize                 redo only the Authorize click in Discord
+  discord-voice sounds                    play the cues
+
+Uses Discord's official local RPC (IPC socket of the running desktop app) with YOUR OWN
+Discord application (Developer Portal; RPC scopes work for the app's owner/team without
+Discord's approval). No user token, no self-botting. Discord must be running.
+Files: ~/.config/discord-voice/config.json + token.json (0600); the client secret lives in
+the GNOME keyring (secret-tool, service "discord-voice"), else in config.json.
+Env: DISCORD_VOICE_QUIET=1 (no sound/notification), DISCORD_VOICE_GUILD / _CHANNEL (names).
+"""
+import fcntl
+import getpass
+import json
+import math
+import os
+import socket
+import struct
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import wave
+from pathlib import Path
+
+CONF = Path.home() / ".config/discord-voice"
+CFG = CONF / "config.json"
+TOKEN = CONF / "token.json"
+SOUNDS = Path.home() / ".local/share/discord-voice/sounds"
+API = "https://discord.com/api/v10"
+SCOPES = ["rpc", "rpc.voice.read", "rpc.voice.write"]
+DEFAULT_REDIRECT = "http://127.0.0.1"
+QUIET = os.environ.get("DISCORD_VOICE_QUIET") == "1"
+UA = "DiscordBot (local-discord-voice, 1.0)"
+
+
+class Fail(Exception):
+    pass
+
+
+# ---- config / secrets -----------------------------------------------------------------
+def load(path, default=None):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {} if default is None else default
+
+
+def save(path, data):
+    CONF.mkdir(parents=True, exist_ok=True)
+    os.chmod(CONF, 0o700)
+    tmp = path.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+
+
+def keyring_get(name):
+    try:
+        r = subprocess.run(["secret-tool", "lookup", "service", "discord-voice", "username", name],
+                           capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() or None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def keyring_set(name, value):
+    try:
+        r = subprocess.run(["secret-tool", "store", "--label", f"discord-voice {name}",
+                            "service", "discord-voice", "username", name],
+                           input=value, text=True, capture_output=True, timeout=30)
+        return r.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def client_secret(cfg):
+    return keyring_get("client_secret") or cfg.get("client_secret")
+
+
+# ---- feedback -----------------------------------------------------------------------
+def make_sounds():
+    """Short Xbox-party-like cues: soft sine chimes with a quick attack and decay."""
+    SOUNDS.mkdir(parents=True, exist_ok=True)
+    cues = {  # name: [(freq Hz, start s, length s)]
+        "join": [(659.3, 0.0, 0.16), (987.8, 0.09, 0.30)],
+        "leave": [(987.8, 0.0, 0.16), (659.3, 0.09, 0.30)],
+        "mute": [(523.3, 0.0, 0.12), (392.0, 0.07, 0.18)],
+        "unmute": [(392.0, 0.0, 0.12), (523.3, 0.07, 0.18)],
+        "error": [(220.0, 0.0, 0.14), (220.0, 0.2, 0.14)],
+    }
+    rate = 48000
+    for name, notes in cues.items():
+        path = SOUNDS / f"{name}.wav"
+        if path.exists():
+            continue
+        n = int(rate * max(s + d for _, s, d in notes) + rate * 0.05)
+        buf = [0.0] * n
+        for f, s, d in notes:
+            i0 = int(s * rate)
+            for i in range(int(d * rate)):
+                t = i / rate
+                env = min(1.0, t / 0.008) * math.exp(-t / (d / 3.2))
+                v = math.sin(2 * math.pi * f * t) + 0.25 * math.sin(4 * math.pi * f * t)
+                buf[i0 + i] += 0.30 * env * v
+        with wave.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(b"".join(struct.pack("<h", int(max(-1, min(1, x)) * 32000))
+                                   for x in buf))
+
+
+def cue(sound, title, body=""):
+    if QUIET:
+        return
+    make_sounds()
+    for player in ("pw-play", "paplay"):
+        try:
+            subprocess.Popen([player, str(SOUNDS / f"{sound}.wav")], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            break
+        except OSError:
+            continue
+    try:
+        subprocess.Popen(["notify-send", "-a", "Discord voice", "-i", "com.discordapp.Discord",
+                          "-e", "-h", "string:x-canonical-private-synchronous:discord-voice",
+                          title, body], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError:
+        pass
+
+
+# ---- HTTP (token exchange, optional bot checks) -------------------------------------
+def http(method, url, data=None, headers=None, form=False):
+    h = {"User-Agent": UA, **(headers or {})}
+    body = None
+    if data is not None:
+        if form:
+            body = urllib.parse.urlencode(data).encode()
+            h["Content-Type"] = "application/x-www-form-urlencoded"
+        else:
+            body = json.dumps(data).encode()
+            h["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read() or b"{}")
+        except ValueError:
+            return e.code, {}
+    except (urllib.error.URLError, OSError) as e:
+        raise Fail(f"network error: {e}")
+
+
+def token_request(cfg, **fields):
+    secret = client_secret(cfg)
+    if not secret:
+        raise Fail("no client secret stored - run: discord-voice setup")
+    data = {"client_id": cfg["client_id"], "client_secret": secret, **fields}
+    code, js = http("POST", f"{API}/oauth2/token", data, form=True)
+    if code != 200 and "redirect_uri" in data:          # retry without it (RPC codes)
+        data.pop("redirect_uri")
+        code2, js2 = http("POST", f"{API}/oauth2/token", data, form=True)
+        if code2 == 200:
+            code, js = code2, js2
+    if code != 200:
+        raise Fail(f"token request failed ({code}): {js.get('error_description') or js}")
+    js["expires_at"] = time.time() + js.get("expires_in", 0) - 300
+    save(TOKEN, js)
+    return js
+
+
+# ---- local RPC ----------------------------------------------------------------------
+def ipc_paths():
+    run = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    dirs = [run, run / "app/com.discordapp.Discord", run / "snap.discord",
+            run / "app/dev.vencord.Vesktop", Path("/tmp")]
+    return [d / f"discord-ipc-{i}" for d in dirs for i in range(10)]
+
+
+class RPC:
+    def __init__(self, client_id):
+        self.sock = None
+        for p in ipc_paths():
+            if not p.exists():
+                continue
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(10)
+            try:
+                s.connect(str(p))
+            except OSError:
+                s.close()
+                continue
+            self.sock = s
+            break
+        if self.sock is None:
+            raise Fail("Discord is not running (no RPC socket) - start Discord first")
+        self.send(0, {"v": 1, "client_id": str(client_id)})
+        op, msg = self.recv()
+        if op == 2 or msg.get("evt") != "READY":
+            raise Fail(f"Discord refused the connection: {msg.get('message') or msg}")
+        self.user = msg.get("data", {}).get("user", {})
+
+    def send(self, op, obj):
+        data = json.dumps(obj).encode()
+        self.sock.sendall(struct.pack("<II", op, len(data)) + data)
+
+    def _read(self, n):
+        out = b""
+        while len(out) < n:
+            chunk = self.sock.recv(n - len(out))
+            if not chunk:
+                raise Fail("Discord closed the RPC connection")
+            out += chunk
+        return out
+
+    def recv(self):
+        op, ln = struct.unpack("<II", self._read(8))
+        return op, json.loads(self._read(ln))
+
+    def call(self, cmd, args=None, timeout=10):
+        nonce = str(uuid.uuid4())
+        self.send(1, {"cmd": cmd, "args": args or {}, "nonce": nonce})
+        self.sock.settimeout(timeout)
+        while True:
+            try:
+                op, msg = self.recv()
+            except socket.timeout:
+                raise Fail(f"{cmd}: Discord did not answer in {timeout}s")
+            if op == 2:
+                raise Fail(f"{cmd}: connection closed: {msg.get('message') or msg}")
+            if msg.get("nonce") != nonce:
+                continue
+            if msg.get("evt") == "ERROR":
+                d = msg.get("data", {})
+                raise Fail(f"{cmd}: {d.get('message')} (code {d.get('code')})")
+            return msg.get("data")
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def authorize(rpc, cfg):
+    print("Discord shows an Authorize window now - click Authorize (2 minutes).", flush=True)
+    cue("join", "Discord voice", "Click Authorize in Discord (one time)")
+    data = rpc.call("AUTHORIZE", {"client_id": cfg["client_id"], "scopes": SCOPES}, timeout=120)
+    return token_request(cfg, grant_type="authorization_code", code=data["code"],
+                         redirect_uri=cfg.get("redirect_uri", DEFAULT_REDIRECT))
+
+
+def start_discord():
+    """From the couch: start Discord (minimized) when it is not running, wait for RPC."""
+    if not any(p.exists() for p in ipc_paths()):
+        cue("join", "Starting Discord…")
+        for cmd in (["flatpak", "run", "com.discordapp.Discord", "--start-minimized"],
+                    ["discord", "--start-minimized"]):
+            try:
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+                break
+            except OSError:
+                continue
+    for _ in range(60):
+        if any(p.exists() for p in ipc_paths()):
+            time.sleep(1.0)
+            return
+        time.sleep(1.0)
+
+
+def connect(interactive=False, launch=False):
+    cfg = load(CFG)
+    if not cfg.get("client_id"):
+        raise Fail("not set up yet - run: discord-voice setup")
+    if launch:
+        start_discord()
+    for attempt in range(8 if launch else 1):      # Discord just started: RPC opens late
+        try:
+            rpc = RPC(cfg["client_id"])
+            break
+        except Fail:
+            if attempt == (8 if launch else 1) - 1:
+                raise
+            time.sleep(2.5)
+    tok = load(TOKEN)
+    try:
+        if tok.get("refresh_token") and time.time() > tok.get("expires_at", 0):
+            tok = token_request(cfg, grant_type="refresh_token",
+                                refresh_token=tok["refresh_token"])
+        if not tok.get("access_token"):
+            if not interactive:
+                raise Fail("not authorized yet - run: discord-voice authorize")
+            tok = authorize(rpc, cfg)
+        try:
+            rpc.call("AUTHENTICATE", {"access_token": tok["access_token"]})
+        except Fail:
+            if tok.get("refresh_token"):
+                tok = token_request(cfg, grant_type="refresh_token",
+                                    refresh_token=tok["refresh_token"])
+            elif interactive:
+                tok = authorize(rpc, cfg)
+            else:
+                raise
+            rpc.call("AUTHENTICATE", {"access_token": tok["access_token"]})
+    except Exception:
+        rpc.close()
+        raise
+    return rpc, cfg
+
+
+def server_name():
+    """The Discord server to join: ~/.config/discord-voice/server (one line, its name)."""
+    try:
+        name = (CONF / "server").read_text().strip()
+    except OSError:
+        name = ""
+    if not name:
+        raise Fail("set your server once:  echo 'My Server' > ~/.config/discord-voice/server")
+    return name
+
+
+def find_channel(rpc, cfg):
+    gname = os.environ.get("DISCORD_VOICE_GUILD") or cfg.get("guild_name") or server_name()
+    cname = os.environ.get("DISCORD_VOICE_CHANNEL") or cfg.get("channel_name", "General")
+    if cfg.get("channel_id") and cfg.get("_for") == f"{gname}/{cname}":
+        return cfg["channel_id"], cfg.get("channel_label", cname)
+    guilds = rpc.call("GET_GUILDS").get("guilds", [])
+    g = next((g for g in guilds if g["name"].lower() == gname.lower()), None)
+    if not g:
+        raise Fail(f'server "{gname}" not found in your Discord')
+    chans = rpc.call("GET_CHANNELS", {"guild_id": g["id"]}).get("channels", [])
+    voice = [c for c in chans if c.get("type") in (2, 13)]
+    c = next((c for c in voice if c["name"].lower() == cname.lower()), None) \
+        or next((c for c in voice if cname.lower() in c["name"].lower()), None)
+    if not c:
+        raise Fail(f'no voice channel "{cname}" in {g["name"]}: {[c["name"] for c in voice]}')
+    cfg.update(guild_id=g["id"], channel_id=c["id"], _for=f"{gname}/{cname}",
+               channel_label=f'{c["name"]} · {g["name"]}')
+    save(CFG, cfg)
+    return c["id"], cfg["channel_label"]
+
+
+def people(ch):
+    out = []
+    for vs in (ch or {}).get("voice_states", []):
+        n = vs.get("nick") or vs.get("user", {}).get("global_name") or vs.get("user", {}).get(
+            "username", "?")
+        st = vs.get("voice_state", {})
+        if st.get("self_deaf") or st.get("deaf"):
+            n += " (deafened)"
+        elif st.get("self_mute") or st.get("mute"):
+            n += " (muted)"
+        out.append(n)
+    return out
+
+
+# ---- commands -----------------------------------------------------------------------
+def do(cmd):
+    rpc, cfg = connect(launch=cmd in ("join", "toggle"))
+    try:
+        cur = rpc.call("GET_SELECTED_VOICE_CHANNEL")
+        if cmd == "status":
+            if not cur:
+                print("not in voice")
+                return 0
+            vs = rpc.call("GET_VOICE_SETTINGS")
+            flags = [f for f, on in (("muted", vs.get("mute")), ("deafened", vs.get("deaf")))
+                     if on]
+            print(f"in voice: {cur.get('name')}" + (f" ({', '.join(flags)})" if flags else ""))
+            for p in people(cur):
+                print(f"  - {p}")
+            return 0
+        if cmd == "toggle":
+            target, _ = find_channel(rpc, cfg)
+            cmd = "leave" if cur and cur.get("id") == target else "join"
+        if cmd == "join":
+            target, label = find_channel(rpc, cfg)
+            if cur and cur.get("id") == target:
+                cue("join", f"Already in {label}", ", ".join(people(cur)))
+                print(f"already in {label}")
+                return 0
+            ch = rpc.call("SELECT_VOICE_CHANNEL", {"channel_id": target, "force": True},
+                          timeout=15)
+            who = [p for p in people(ch) if p]
+            cue("join", f"Joined {label}", ", ".join(who) or "nobody else here yet")
+            print(f"joined {label}" + (f": {', '.join(who)}" if who else ""))
+        elif cmd == "leave":
+            if not cur:
+                cue("leave", "Not in voice")
+                print("not in voice")
+                return 0
+            rpc.call("SELECT_VOICE_CHANNEL", {"channel_id": None}, timeout=15)
+            cue("leave", f"Left {cur.get('name')}")
+            print(f"left {cur.get('name')}")
+        elif cmd in ("mute", "deafen", "unmute", "undeafen"):
+            vs = rpc.call("GET_VOICE_SETTINGS")
+            key = "deaf" if "deaf" in cmd else "mute"
+            new = (not vs.get(key)) if cmd in ("mute", "deafen") else False
+            rpc.call("SET_VOICE_SETTINGS", {key: new})
+            word = ("Deafened" if new else "Undeafened") if key == "deaf" else \
+                   ("Muted" if new else "Unmuted")
+            cue("mute" if new else "unmute", word,
+                f"in {cur.get('name')}" if cur else "(not in a voice channel)")
+            print(word.lower())
+        return 0
+    finally:
+        rpc.close()
+
+
+def setup():
+    cfg = load(CFG)
+    print("Discord Developer Portal -> your app (your bot's application) -> OAuth2:\n"
+          f"  1. add Redirect  {DEFAULT_REDIRECT}  and Save\n"
+          "  2. copy Client ID, and Reset Secret -> copy Client Secret\n"
+          "The Discord account logged in here must own the app (or be on its team).")
+    cid = input(f"Client ID [{cfg.get('client_id', '')}]: ").strip() or cfg.get("client_id")
+    if not cid or not cid.isdigit():
+        raise Fail("client ID must be a number")
+    secret = getpass.getpass("Client Secret (hidden; Enter keeps the stored one): ").strip()
+    cfg.update(client_id=cid, redirect_uri=cfg.get("redirect_uri", DEFAULT_REDIRECT))
+    cfg.pop("channel_id", None)
+    if secret:
+        if keyring_set("client_secret", secret):
+            cfg.pop("client_secret", None)
+        else:
+            cfg["client_secret"] = secret
+    save(CFG, cfg)
+    if TOKEN.exists():
+        TOKEN.unlink()
+    rpc, cfg = connect(interactive=True)
+    try:
+        print(f"authorized as {rpc.user.get('username')}")
+        _, label = find_channel(rpc, cfg)
+        print(f"voice channel: {label} (id {cfg['channel_id']})")
+    finally:
+        rpc.close()
+    return 0
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    if cmd == "sounds":
+        for s in ("join", "leave", "mute", "unmute"):
+            cue(s, f"cue: {s}")
+            time.sleep(0.7)
+        return 0
+    CONF.mkdir(parents=True, exist_ok=True)
+    lock = open(CONF / ".lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)      # controller double-presses run one after another
+    try:
+        if cmd == "setup":
+            return setup()
+        if cmd == "authorize":
+            if TOKEN.exists():
+                TOKEN.unlink()
+            rpc, _ = connect(interactive=True)
+            print(f"authorized as {rpc.user.get('username')}")
+            rpc.close()
+            return 0
+        if cmd not in ("join", "leave", "toggle", "mute", "deafen", "unmute", "undeafen",
+                       "status"):
+            print(__doc__)
+            return 2
+        return do(cmd)
+    except Fail as e:
+        audio = Path.home() / ".local/bin/audio"
+        if cmd == "mute" and audio.exists() and os.environ.get("DISCORD_VOICE_NO_FALLBACK") != "1":
+            # Discord RPC unavailable (not running / not set up): mute the system mic instead.
+            # `audio headset mute` beeps + notifies itself, so no cue of ours here.
+            print(f"discord-voice: {e} -> system mic mute (audio headset mute)", file=sys.stderr)
+            return subprocess.run([str(audio), "headset", "mute"], timeout=20).returncode
+        if cmd != "status":
+            cue("error", "Discord voice", str(e))
+        print(f"discord-voice: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -7,3 +7,9 @@ GxMaximize 1
 GamePadEnable 1
 SoftTargetEnemy 1
 SoftTargetInteract 1
+# Sound (2026-11-14): always on, System Default device (= the TV sink set by `audio wow start`),
+# and keep playing when the window loses focus (XWayland/OSK/notifications must not mute it)
+Sound_EnableAllSound 1
+Sound_OutputDriverIndex 0
+Sound_OutputDriverName System Default
+Sound_EnableSoundWhenGameIsInBG 1

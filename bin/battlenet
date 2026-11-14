@@ -1,33 +1,87 @@
 #!/usr/bin/env bash
 # Battle.net / World of Warcraft via GE-Proton + umu-launcher
-#   battlenet            -> open Battle.net
-#   battlenet --wow      -> open Battle.net and auto-launch WoW Forever
-#   battlenet --kill     -> force-stop everything (Battle.net, Agent, WoW, wineserver)
-#   battlenet --install  -> run the Battle.net installer
+#   battlenet                  -> open Battle.net
+#   battlenet --wow            -> WoW Forever session (sequence below)
+#   battlenet --wow --dry-run  -> log the sequence without launching or changing anything
+#   battlenet --kill           -> force-stop everything (Battle.net, Agent, WoW, wineserver)
+#   battlenet --install        -> run the Battle.net installer
+#   BATTLENET_DEBUG=1 battlenet --wow  -> also write a Proton log to ~/.cache/battlenet
 #
-# Watchdog: Battle.net "closes" to a system tray GNOME doesn't have, so it used to
-# linger invisibly (Agent.exe + wineserver + container, ~1.5GB) and block relaunches.
-# While a session runs, this script watches for a visible Battle.net window or a
-# running Wow.exe; once neither exists for IDLE_LIMIT seconds the whole session is
-# killed. In --wow mode, the session also ends as soon as WoW exits.
+# --wow sequence (every step timestamped in ~/.cache/battlenet/launch.log; hooks are
+# optional, time-limited and never block the launch):
+#   a. couch wow-prep                 per-profile CVars + addons
+#   b. couch wow-display start        TV only while WoW runs (display agent)
+#   c. audio wow start                TV HDMI sink + EasyEffects WoW preset (audio agent)
+#   d. Battle.net --exec="launch WoWF"
+#   e. Wow.exe window appears         -> audio wow route (WoW stream -> TV chain), Battle.net minimized (it also exits by itself:
+#                                        Battle.net.config GameLaunchWindowBehavior=2), WoW focused
+#   f. WoW exits / --kill / TERM,INT,HUP -> audio wow stop, Wine session stopped,
+#                                        couch wow-display stop (once per session)
+#   Lights (govee-wow service) follow Wow.exe by themselves.
+#
+# Crash note (2026-11-14): Wine died with "BadRROutput ... RRGetOutputInfo" whenever mutter
+# re-laid-out the monitors while it ran; the dead process took Battle.net and Wow.exe down with
+# it (BadWindow cascade). Fixes: the prefix has HKCU\Software\Wine\X11 Driver UseXRandR=N
+# (Wine reads monitors via Xinerama and never touches RandR outputs), and the display layout
+# is switched BEFORE Wine starts and restored only AFTER Wine is gone.
+#
+# Watchdog: Battle.net "closes" to a system tray GNOME doesn't have, so it used to linger
+# invisibly (~1.5GB) and block relaunches. A session lives while a visible Battle.net window
+# or Wow.exe exists; after IDLE_LIMIT seconds of neither it is killed. In --wow mode it ends
+# shortly after WoW exits. Battle.net going away while Wow.exe runs never ends the session.
 export WINEPREFIX="$HOME/Games/battlenet"
 export PROTONPATH="$HOME/.local/share/Steam/compatibilitytools.d/GE-Proton11-12-x86_64"
 export GAMEID="umu-battlenet"
 export STORE="battlenet"
 export PROTON_ENABLE_WAYLAND="${PROTON_ENABLE_WAYLAND:-0}"   # X11/XWayland: winewayland draws Battle.net over the GNOME overview. Sharp 133% via mutter xwayland-native-scaling + LogPixels=128
 export PROTON_USE_XALIA=0             # Xalia was crash-looping and polling windows (sluggish UI)
-export PROTON_USE_NTSYNC=1              # kernel ntsync, smoother on kernel 6.14+
+export PROTON_USE_NTSYNC=1            # kernel ntsync (journal shows "ntsync: up and running")
+export WINE_FULLSCREEN_FSR=0          # WoW runs borderless at desktop size: no fake low-res modes/FSR
+if [[ -n "$BATTLENET_DEBUG" ]]; then
+  export PROTON_LOG=1 PROTON_LOG_DIR="$HOME/.cache/battlenet"
+fi
 LAUNCHER="$WINEPREFIX/drive_c/Program Files (x86)/Battle.net/Battle.net Launcher.exe"
 WINESERVER="$PROTONPATH/files/bin/wineserver"
 WM_CLASS="steam_app_battlenet"
 IDLE_LIMIT=10        # seconds with no visible window and no WoW before killing
 STARTUP_GRACE=120    # seconds to wait for the first window to appear
+TIDY_WINDOW=90       # seconds after WoW's window appears during which Battle.net is re-hidden
+COUCH="$HOME/.local/bin/couch"
+AUDIO="$HOME/.local/bin/audio"
+STATE_DIR="$HOME/.cache/battlenet"
+LOG="$STATE_DIR/launch.log"
+SESSION="$STATE_DIR/wow-session"   # exists while the --wow hooks still need their stop step
+mkdir -p "$STATE_DIR"
+[[ -f "$LOG" && $(stat -c %s "$LOG") -gt 524288 ]] && mv -f "$LOG" "$LOG.1"
 
 if [[ "$1" == "--install" || ( "$1" != "--kill" && ! -f "$LAUNCHER" ) ]]; then
   exec gamemoderun "$HOME/.local/bin/umu-run" "${2:-$HOME/Downloads/Battle.net-Setup.exe}"
 fi
 
+DRY=0
+HOOK_OUT=""
+log() {
+  local line; line="$(date '+%F %T.%3N') [$$] $*"
+  echo "$line" >>"$LOG"
+  (( DRY )) && echo "$line"
+  return 0
+}
+
 notify() { command -v notify-send >/dev/null && notify-send -i "$HOME/.local/share/icons/battlenet.png" "Battle.net" "$1"; }
+
+# hook LABEL TIMEOUT CMD... : run an optional step, log its result, never fail
+hook() {
+  local label=$1 limit=$2; shift 2
+  local out rc t0=$SECONDS
+  out=$(timeout "$limit" "$@" 2>&1 </dev/null); rc=$?
+  out=${out//$'\n'/ | }
+  log "$label: rc=$rc ($((SECONDS - t0))s)${out:+ -> ${out:0:300}}"
+  HOOK_OUT=$out
+  return 0
+}
+
+# has_sub FILE PATTERN : the helper script exists and knows that subcommand
+has_sub() { [[ -x "$1" ]] && grep -q -- "$2" "$1" 2>/dev/null; }
 
 # Anything still running out of this prefix (Battle.net, Agent, WoW, CEF helpers, wine services)
 session_pids() { pgrep -f "Battle\.net|Wow\.exe|Agent\.exe|umu-run .*battlenet|$WINEPREFIX" | grep -vx "$$"; }
@@ -35,12 +89,37 @@ session_pids() { pgrep -f "Battle\.net|Wow\.exe|Agent\.exe|umu-run .*battlenet|$
 stop_session() {
   # Each umu-run is its own container, so a running Battle.net can't take commands
   # from a new launch. Shut the whole session down: polite first, then forced.
+  if (( DRY )); then log "would stop the Wine session"; return 0; fi
+  [[ -z "$(session_pids)" ]] && return 0
+  log "stopping Wine session"
   "$WINESERVER" -k 2>/dev/null
   pkill -f "umu-run .*Battle\.net" 2>/dev/null
-  for _ in {1..10}; do [[ -z "$(session_pids)" ]] && return 0; sleep 0.5; done
+  for _ in {1..10}; do
+    [[ -z "$(session_pids)" ]] && { log "Wine session stopped"; return 0; }
+    sleep 0.5
+  done
   "$WINESERVER" -k9 2>/dev/null
   session_pids | xargs -r kill -9 2>/dev/null
   sleep 0.5
+  log "Wine session force-killed"
+}
+
+# Undo the --wow hooks exactly once per session (watchdog, signal trap and --kill may all call
+# this; whoever renames the marker first does the work). Wine is stopped between audio and
+# display on purpose: a monitor re-layout while Wine runs is what crashed it.
+wow_teardown() {
+  local why=$1 claim="$SESSION.$$" dry=()
+  if (( DRY )); then
+    dry=(--dry-run)
+  else
+    mv -f "$SESSION" "$claim" 2>/dev/null || return 0
+    rm -f "$claim"
+  fi
+  log "f. teardown ($why)"
+  has_sub "$AUDIO" wow_stop && hook "f. audio wow stop" 20 "$AUDIO" wow stop "${dry[@]}"
+  stop_session
+  has_sub "$COUCH" wow-display && hook "f. couch wow-display stop" 30 "$COUCH" wow-display stop "${dry[@]}"
+  return 0
 }
 
 # True if any Battle.net/WoW X11 window is actually shown (normal or minimized).
@@ -53,16 +132,95 @@ window_visible() {
   return 1
 }
 
-wow_running() { pgrep -f 'Wow\.exe' >/dev/null; }
+wow_running() { pgrep -f '^[A-Za-z]:.*Wow\.exe' >/dev/null; }
+
+# Exit Game can leave Wow.exe hung after the client has shut down (seen 2026-11-14: Client.log
+# "Client Destroy", window gone, process alive 20+ min - kept the pad paused and the lights on).
+# Hung = the game window no longer exists (a minimized window still does) AND Client.log's
+# last lines say the client was destroyed.
+HUNG_GRACE=8         # seconds hung before Wow.exe is ended
+WOW_LOG="${WOW_DIR:-$WINEPREFIX/drive_c/Program Files (x86)/World of Warcraft/_forever_}/Logs/Client.log"
+wow_exited_hung() {
+  local win=$1
+  xprop -id "$win" WM_CLASS >/dev/null 2>&1 && return 1     # window still exists (maybe minimized)
+  tail -n 5 "$WOW_LOG" 2>/dev/null | grep -q 'Client Destroy'
+}
+end_hung_wow() {
+  log "Wow.exe hung after Exit Game (client destroyed, window gone ${HUNG_GRACE}s): ending it"
+  pkill -TERM -f '^[A-Za-z]:.*Wow\.exe' 2>/dev/null
+  local i
+  for i in 1 2 3 4 5; do wow_running || return 0; sleep 1; done
+  pkill -KILL -f '^[A-Za-z]:.*Wow\.exe' 2>/dev/null
+}
+
+# WoW's game window: titled "World of Warcraft". With $1=1 also accept any big mapped
+# non-Battle.net window of the Proton class (in case Forever titles itself differently).
+wow_window() {
+  local w name width
+  w=$(xdotool search --all --onlyvisible --class "$WM_CLASS" --name '^World of Warcraft' 2>/dev/null | head -n1)
+  if [[ -n "$w" ]]; then echo "$w"; return 0; fi
+  (( ${1:-0} )) || return 0
+  for w in $(xdotool search --onlyvisible --class "$WM_CLASS" 2>/dev/null); do
+    name=$(xdotool getwindowname "$w" 2>/dev/null)
+    [[ -z "$name" || "$name" == *Battle.net* ]] && continue
+    width=$(xdotool getwindowgeometry "$w" 2>/dev/null | awk '/Geometry/{split($2,a,"x"); print a[1]}')
+    if (( ${width:-0} >= 800 )); then echo "$w"; return 0; fi
+  done
+}
+
+# Battle.net launcher windows currently shown in Normal state (never the game window $1)
+launcher_windows() {
+  local w
+  for w in $(xdotool search --all --onlyvisible --class "$WM_CLASS" --name 'Battle\.net' 2>/dev/null); do
+    [[ "$w" == "$1" ]] && continue
+    xprop -id "$w" WM_STATE 2>/dev/null | grep -q 'window state: Normal' && echo "$w"
+  done
+}
+
+# Get Battle.net out of the way and give WoW the focus
+tidy_up() {
+  local wow=$1 w n=0
+  for w in $(launcher_windows "$wow"); do
+    xdotool windowminimize "$w" 2>/dev/null && n=$((n + 1))
+  done
+  xdotool windowactivate "$wow" 2>/dev/null
+  log "e. minimized $n Battle.net window(s), focused WoW window $wow"
+}
 
 watchdog() {
-  local mode="$1" child="$2" start=$SECONDS seen=0 idle=0 wow_seen=0
-  while kill -0 "$child" 2>/dev/null; do
+  local mode="$1" child="$2" start=$SECONDS seen=0 idle=0
+  local wow_seen=0 wow_since=0 wow_win="" tidy_until=0 exit_logged=0 hung=0
+  # Keep watching while umu-run lives OR WoW runs: Battle.net may exit by itself after Play.
+  while kill -0 "$child" 2>/dev/null || wow_running; do
     sleep 2
     if wow_running; then
-      seen=1; wow_seen=1; idle=0; continue
+      seen=1; idle=0
+      if (( ! wow_seen )); then wow_seen=1; wow_since=$SECONDS; log "Wow.exe running"; fi
+      if [[ -z "$wow_win" ]]; then
+        wow_win=$(wow_window $(( SECONDS - wow_since >= 30 )))
+        if [[ -n "$wow_win" ]]; then
+          log "e. WoW window appeared: $wow_win \"$(xdotool getwindowname "$wow_win" 2>/dev/null)\""
+          tidy_up "$wow_win"
+          tidy_until=$((SECONDS + TIDY_WINDOW))
+          # WoW's sound stream exists by now: pin it on the TV chain (unmuted, 100%) and make
+          # sure EasyEffects really feeds the TV. Background: never delays the watchdog.
+          if [[ "$mode" == wow ]] && has_sub "$AUDIO" wow_route; then
+            ( hook "e. audio wow route" 75 "$AUDIO" wow route --wait 60 ) &
+          fi
+        fi
+      elif wow_exited_hung "$wow_win"; then
+        hung=$((hung + 2))
+        if (( hung >= HUNG_GRACE )); then end_hung_wow; hung=0; fi
+      elif (( SECONDS < tidy_until )) && [[ -n "$(launcher_windows "$wow_win")" ]]; then
+        hung=0
+        tidy_up "$wow_win"   # Battle.net popped back up during WoW's startup
+      else
+        hung=0
+      fi
+      continue
     fi
-    if [[ "$mode" == wow && $wow_seen == 1 ]]; then
+    if (( wow_seen && ! exit_logged )); then exit_logged=1; log "Wow.exe exited"; fi
+    if [[ "$mode" == wow ]] && (( wow_seen )); then
       idle=$((idle + 2))                      # WoW closed: wind down shortly after
     elif window_visible; then
       seen=1; idle=0; continue
@@ -70,37 +228,77 @@ watchdog() {
       idle=$((idle + 2))
     fi
     if (( idle >= IDLE_LIMIT )); then
-      stop_session
+      log "watchdog: nothing to keep alive for ${idle}s (mode=$mode)"
+      if [[ "$mode" == wow ]]; then wow_teardown "WoW exited"; else stop_session; fi
       break
     fi
   done
   # umu-run finished on its own: make sure nothing it started is left behind
+  [[ "$mode" == wow ]] && wow_teardown "session ended"
   [[ -n "$(session_pids)" ]] && stop_session
+  return 0
 }
 
 mode=launcher
 case "$1" in
   --kill)
+    log "--kill requested"
     stop_session
-    [[ -z "$(session_pids)" ]] && notify "Battle.net stopped." || notify "Some Battle.net processes would not die."
+    wow_teardown "--kill"
+    if [[ -z "$(session_pids)" ]]; then notify "Battle.net stopped."; else notify "Some Battle.net processes would not die."; fi
     exit 0 ;;
   --wow)
     shift; mode=wow
-    if wow_running; then notify "WoW is already running."; exit 0; fi
-    if pgrep -f 'Battle\.net\.exe' >/dev/null; then stop_session; fi
+    if [[ "$1" == "--dry-run" ]]; then DRY=1; shift; fi
+    log "=== battlenet --wow$( (( DRY )) && echo ' --dry-run')"
+    if wow_running; then log "WoW already running, nothing to do"; notify "WoW is already running."; exit 0; fi
+    if pgrep -f 'Battle\.net\.exe' >/dev/null; then log "Battle.net already running: restarting session"; stop_session; fi
     set -- --exec="launch WoWF" "$@" ;;   # game family ID is case-sensitive: "wowf" silently falls back to W3
   *)
     if pgrep -f 'Battle\.net\.exe' >/dev/null; then
       if window_visible || wow_running; then notify "Battle.net is already open."; exit 0; fi
       stop_session   # stale, invisible session left behind: clear it and relaunch
-    fi ;;
+    fi
+    log "=== battlenet (launcher)" ;;
 esac
 
-# Couch (TV + controller) vs desk profile: graphics + which UI addons load
-"$HOME/.local/bin/couch" wow-prep >/dev/null 2>&1
+if [[ "$mode" == wow ]]; then
+  dry=(); (( DRY )) && dry=(--dry-run)
+  (( DRY )) || echo "$$" >"$SESSION"
+  trap 'log "signal received"; wow_teardown signal; exit 0' TERM INT HUP
+  # a. couch profile: graphics CVars + which UI addons load
+  if (( DRY )); then log "a. would run: couch wow-prep"
+  elif [[ -x "$COUCH" ]]; then hook "a. couch wow-prep" 20 "$COUCH" wow-prep
+  else log "a. couch: not installed, skipped"; fi
+  # b. display: TV only while WoW runs (before Wine starts, so Wine never sees a re-layout)
+  if has_sub "$COUCH" wow-display; then
+    hook "b. couch wow-display start" 30 "$COUCH" wow-display start --pid "$$" "${dry[@]}"
+    [[ "$HOOK_OUT" == *applied* ]] && sleep 1.5   # let mutter/Xwayland settle the new layout
+  else log "b. couch wow-display: not available, skipped"; fi
+  # c. audio: TV sink + EasyEffects WoW preset
+  if has_sub "$AUDIO" wow_start; then
+    hook "c. audio wow start" 20 "$AUDIO" wow start "${dry[@]}"
+  else log "c. audio wow: not available, skipped"; fi
+else
+  trap 'stop_session; exit 0' TERM INT HUP
+  "$COUCH" wow-prep >/dev/null 2>&1
+fi
+
+# d. Battle.net (WoW auto-launch via --exec in --wow mode)
+if (( DRY )); then
+  log "d. would launch: gamemoderun umu-run \"$LAUNCHER\" $*"
+  log "   env: PROTON_ENABLE_WAYLAND=$PROTON_ENABLE_WAYLAND PROTON_USE_NTSYNC=$PROTON_USE_NTSYNC PROTON_USE_XALIA=$PROTON_USE_XALIA WINE_FULLSCREEN_FSR=$WINE_FULLSCREEN_FSR"
+  log "   prefix UseXRandR=N: $(grep -c '^"UseXRandR"="N"' "$WINEPREFIX/user.reg") (1 = Wine stays off RandR)"
+  log "   Battle.net.config: $(grep -o '"GameLaunchWindowBehavior": *"[0-9]"' "$WINEPREFIX/drive_c/users/steamuser/AppData/Roaming/Battle.net/Battle.net.config") (2 = exit after Play)"
+  log "e. would wait for the Wow.exe window, minimize Battle.net, focus WoW"
+  wow_teardown "dry-run"
+  log "=== dry-run done"
+  exit 0
+fi
+log "d. launching Battle.net $*"
 gamemoderun "$HOME/.local/bin/umu-run" "$LAUNCHER" "$@" &
 child=$!
-trap 'stop_session; exit 0' TERM INT HUP
 watchdog "$mode" "$child"
 wait "$child" 2>/dev/null
+log "=== launcher exit"
 exit 0

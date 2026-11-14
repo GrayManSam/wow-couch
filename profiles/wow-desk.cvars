@@ -5,3 +5,7 @@ vsync 0
 maxFPS 60
 GxMaximize 1
 GamePadEnable 1
+# Sound: System Default device (follows the desktop output)
+Sound_EnableAllSound 1
+Sound_OutputDriverIndex 0
+Sound_OutputDriverName System Default

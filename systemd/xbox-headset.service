@@ -1,0 +1,12 @@
+[Unit]
+Description=Xbox controller headset: TV + headset sound, headset mic (xbox-headset)
+PartOf=graphical-session.target
+After=graphical-session.target pipewire-pulse.service wireplumber.service
+
+[Service]
+ExecStart=%h/.local/bin/xbox-headset watch
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

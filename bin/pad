@@ -10,6 +10,8 @@
   pad auto on|off  turn desktop mode on whenever a controller connects (default on)
 
 From the controller itself: hold the Xbox button for 1 second to toggle.
+Discord voice (works in games too, the Share button is unbound in WoW): hold Share 0.6s =
+join/leave General voice, double-tap Share = mute, triple-tap = deafen (discord-voice).
 Desktop mode pauses itself while a game runs (patterns in ~/.config/padmode/games),
 so WoW / Steam games get the controller to themselves.
 Stdlib only: reads /dev/input/eventN, writes a virtual mouse+keyboard via /dev/uinput.
@@ -23,12 +25,18 @@ import sys
 import time
 from pathlib import Path
 
-CONF = Path.home() / ".config/padmode"
+CONF = Path(os.environ.get("PADMODE_CONF") or Path.home() / ".config/padmode")  # env: tests
 STATE = CONF / "state"
 GAMES = CONF / "games"
 AUTO_ON = CONF / "auto-on-connect"   # "on" = enable desktop mode whenever a controller connects
-STATUS = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "padmode.status"
+STATUS = Path(os.environ.get("PADMODE_STATUS")
+              or Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "padmode.status")
+DEVICE_MATCH = os.environ.get("PADMODE_DEVICE", "xbox").lower()   # controller name substring
+QUIET = os.environ.get("PADMODE_QUIET") == "1"                     # tests: no notifications
 DEFAULT_GAMES = ["Wow.exe", "SteamLaunch", "gamescope"]
+VOICE = Path(os.environ.get("PADMODE_VOICE") or Path.home() / ".local/bin/discord-voice")
+SHARE_HOLD = 0.6         # hold Share this long: join/leave Discord voice
+SHARE_TAPS = 0.35        # gap that ends a Share tap sequence (1 screenshot, 2 mute, 3 deafen)
 
 # ---- tuning -------------------------------------------------------------------------
 POINTER_MAX = 1700.0     # px/s at full stick
@@ -63,7 +71,7 @@ UI_DEV_CREATE, UI_DEV_DESTROY = 0x5501, 0x5502
 BASE = {
     "A": ("hold", BTN_LEFT), "X": ("hold", BTN_RIGHT), "B": ("hold", K["ESC"]),
     "Y": ("call", "osk"), "RS": ("hold", BTN_MIDDLE), "LS": ("call", "precision"),
-    "MENU": ("hold", K["ENTER"]), "SHARE": ("tap", [], K["SYSRQ"]),
+    "MENU": ("hold", K["ENTER"]),   # Share: see share_press (screenshot / Discord voice)
     "LB": ("switch", -1), "RB": ("switch", 1),
     "LT": ("tap", [K["CTRL"], K["SHIFT"]], K["TAB"]), "RT": ("tap", [K["CTRL"]], K["TAB"]),
     "DU": ("hold", K["UP"]), "DD": ("hold", K["DOWN"]),
@@ -87,7 +95,11 @@ KEYS_HELP = """\
  D-pad .......... arrow keys         Menu (≡) ....... Enter
  LB / RB ........ prev / next window (tap again to keep cycling, A picks)
  LT / RT ........ prev / next tab    Xbox tap ....... Activities / search
- Share .......... screenshot         View tap ....... show this help
+ Share tap ...... screenshot         View tap ....... show this help
+
+ DISCORD VOICE (also while a game runs)
+ Hold Share ..... join / leave General voice (discord-voice)
+ Share ×2 ....... mute / unmute      Share ×3 ....... deafen / undeafen
 
  HOLD VIEW (⧉) +
  D-pad ↑/↓ ...... volume             D-pad ←/→ ...... prev / next track
@@ -97,7 +109,8 @@ KEYS_HELP = """\
  LB / RB ........ browser back / fwd LT / RT ........ zoom out / in"""
 NOTIFY_HELP = ("A click · X right-click · B Esc · Y keyboard · ≡ Enter\n"
                "LB/RB windows · LT/RT tabs · Xbox overview · L-click precision\n"
-               "View+: ↑↓ vol · ←→ track · A play · Y audio · B close · X tab")
+               "View+: ↑↓ vol · ←→ track · A play · Y audio · B close · X tab\n"
+               "Share: hold voice join/leave · ×2 mute · ×3 deafen")
 
 
 def sh(*cmd):
@@ -108,7 +121,13 @@ def sh(*cmd):
         pass
 
 
+def log(msg):
+    print(msg, flush=True)                 # -> journalctl --user -u padmode
+
+
 def notify(body, title="Controller"):
+    if QUIET:
+        return
     sh("notify-send", "-a", "pad", "-i", "input-gaming", "-e",
        "-h", "string:x-canonical-private-synchronous:pad", title, body)
 
@@ -152,30 +171,45 @@ def big_picture_open():
 
 
 def running_game(patterns):
+    """(pattern, pid, cmdline) of the first process that IS a game, else None.
+    Matches the program name (argv[0] basename, which Wine sets to C:\\...\\Wow.exe, or
+    comm), not the whole command line: a shell, grep or log tail that merely mentions
+    "Wow.exe" must not keep desktop mode paused after the game is gone. Steam launches run
+    under `reaper SteamLaunch AppId=...`, so for reaper its arguments count too."""
     me = str(os.getpid())
     for pid in os.listdir("/proc"):
         if not pid.isdigit() or pid == me:
             continue
         try:
-            cmd = Path(f"/proc/{pid}/cmdline").read_bytes()
+            argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            comm = Path(f"/proc/{pid}/comm").read_bytes().strip()
         except OSError:
             continue
+        name = argv[0].replace(b"\\", b"/").rsplit(b"/", 1)[-1] if argv else b""
+        args = argv[1:] if name == b"reaper" else []
         for p in patterns:
-            if p in cmd:
-                return p.decode()
+            if p in name or p in comm or p in args:
+                return p.decode(), pid, b" ".join(argv).strip()[:160].decode(errors="replace")
     return None
 
 
 # ---- devices ------------------------------------------------------------------------
 def find_controller():
+    """The Xbox controller over Bluetooth (hid-microsoft), USB (xpad) or the Xbox Wireless
+    Adapter (xone): a real (non-virtual) gamepad with sticks whose name says Xbox, or with
+    Microsoft's USB vendor id. Virtual pads (Steam Input, our own uinput) are skipped."""
     for ev in sorted(Path("/sys/class/input").glob("event*")):
         try:
             name = (ev / "device/name").read_text().strip()
             keybits = (ev / "device/capabilities/key").read_text().split()
-        except OSError:
+            absbits = int((ev / "device/capabilities/abs").read_text().split()[-1], 16)
+            vendor = (ev / "device/id/vendor").read_text().strip().lower()
+            real = "/devices/virtual/" not in str((ev / "device").resolve())
+        except (OSError, ValueError):
             continue
-        # must be a gamepad (BTN_SOUTH = 0x130 = word 4, bit 48)
-        if "xbox" in name.lower() and len(keybits) >= 5 and (int(keybits[-5], 16) >> 48) & 1:
+        # must be a gamepad (BTN_SOUTH = 0x130 = word 4, bit 48) with a left stick
+        pad = len(keybits) >= 5 and (int(keybits[-5], 16) >> 48) & 1 and absbits & 0b11
+        if real and pad and (DEVICE_MATCH in name.lower() or vendor == "045e"):
             return f"/dev/input/{ev.name}", name
     return None, None
 
@@ -198,6 +232,7 @@ class Pad:
             except OSError:
                 self.info[code] = (-32768, 32767)
         self.grabbed = False
+        self.grab_failed = False
         self.ff_id = -1
 
     def norm(self, code, val):
@@ -212,8 +247,14 @@ class Pad:
             try:
                 fcntl.ioctl(self.fd, EVIOCGRAB, int(on))
                 self.grabbed = on
-            except OSError:
-                pass
+            except OSError as e:
+                if not self.grab_failed:
+                    log(f"grab({on}) failed: {e} (retrying every second)")
+                self.grab_failed = True
+                return
+            if self.grab_failed:
+                log(f"grab({on}) ok")
+            self.grab_failed = False
 
     def rumble(self, strong, weak, ms):
         try:
@@ -286,8 +327,12 @@ class Daemon:
         self.enabled = read_state()
         self.state_mtime = 0.0
         self.game = None
+        self.on_at_pause = False   # desktop mode was on when the game paused it
+        self.off_at = -1e9         # monotonic time desktop mode was last switched off
         self.next_game_check = 0.0
         self.reset()
+        log(f"start: state={'on' if self.enabled else 'off'} auto-on-connect="
+            f"{'on' if auto_on() else 'off'}")
 
     def reset(self):
         self.axes = {}
@@ -300,6 +345,9 @@ class Daemon:
         self.switching = 0.0    # time Alt should be released (0 = not switching)
         self.acc = [0.0, 0.0, 0.0, 0.0]
         self.legacy = [0.0, 0.0]
+        self.share_taps = 0     # Share taps in the current sequence
+        self.share_until = 0.0  # sequence ends (and runs) at this time
+        self.share_held = False # the hold already ran voice toggle
 
     @property
     def active(self):
@@ -335,8 +383,11 @@ class Daemon:
             notify(*announce)
         self.set_status()
 
-    def toggle(self, on):
+    def toggle(self, on, why=""):
+        log(f"desktop mode {'on' if on else 'off'} ({why or 'toggle'})")
         was = self.active
+        if self.enabled and not on:
+            self.off_at = time.monotonic()
         self.enabled = on
         write_state(on)
         self.state_mtime = STATE.stat().st_mtime
@@ -360,24 +411,41 @@ class Daemon:
         if m != self.state_mtime:
             self.state_mtime = m
             on = read_state()
+            log(f"state file changed: {'on' if on else 'off'}")
             if on != self.enabled:
-                self.toggle(on)
+                self.toggle(on, "state file: pad on/off, couch")
 
     def check_game(self, now):
         if now < self.next_game_check:
             return
         self.next_game_check = now + 2.0
-        game = running_game(game_patterns())
+        hit = running_game(game_patterns())
+        game = hit[0] if hit else None
         if game is None and big_picture_open():
             game = "Steam Big Picture"
         if game != self.game:
-            was = self.active
+            was, game_was = self.active, self.game
             self.game = game
-            msg = None
-            if self.enabled:
-                msg = ((f"Paused for {game}", "Controller") if game
-                       else ("Game closed — desktop mode back on", "Controller"))
-            self.apply(was, msg)
+            if game:
+                if game_was is None:
+                    # "on" also if it went off just before (TV blip as the launcher switches
+                    # to TV-only, before this 2 s poll saw the game)
+                    self.on_at_pause = self.enabled or now - self.off_at < 15.0
+                log(f"pause: {game}" + (f" (pid {hit[1]}: {hit[2]})" if hit else ""))
+                self.apply(was, (f"Paused for {game}", "Controller") if self.enabled else None)
+            elif self.pad is not None and not self.enabled and self.on_at_pause and auto_on():
+                # Desktop mode was on when the game started, the controller is still connected,
+                # but something switched it off DURING the game (TV HDMI blip -> couch
+                # `pad off`; older versions: a long press on the Xbox button, which is WoW's
+                # game-menu button). Same rule as a controller connecting: back on.
+                log("resume: game closed; was on before it, switched off during it -> on again")
+                self.toggle(True, "game closed")
+                self.apply(was, ("Game closed — desktop mode back on", "Controller"))
+            else:
+                log(f"resume: game closed (desktop mode {'on' if self.enabled else 'off'}, "
+                    f"controller {'connected' if self.pad else 'not connected'})")
+                self.apply(was, ("Game closed — desktop mode back on", "Controller")
+                           if self.enabled and self.pad else None)
 
     def check_pad(self):
         if self.pad is not None and not Path(f"/proc/self/fd/{self.pad.fd}").exists():
@@ -388,8 +456,9 @@ class Daemon:
                 try:
                     self.pad, self.pad_name = Pad(path), name
                     self.reset()
+                    log(f"controller connected: {name} at {path}")
                     if auto_on() and not self.enabled:
-                        self.toggle(True)          # controller connected (USB or Bluetooth)
+                        self.toggle(True, "controller connected")  # USB or Bluetooth
                     elif self.enabled and self.game is None:
                         self.pad.grab(True)
                 except OSError:
@@ -403,6 +472,7 @@ class Daemon:
         except OSError:
             pass
         self.pad = None
+        log("controller disconnected")
         if was:
             self.out.release_all()
         self.set_status()
@@ -427,10 +497,43 @@ class Daemon:
                                capture_output=True, text=True, timeout=20)
             notify((r.stdout.strip() or "audio toggled").splitlines()[-1], "Audio")
 
+    # -- Share: Discord voice in any mode (nothing grabs or blocks the game's input) --
+    def voice(self, cmd):
+        if self.pad:
+            self.pad.rumble(0x9000, 0x9000, 90) if cmd == "toggle" else \
+                self.pad.rumble(0, 0x7000, 70)
+        log(f"discord voice: {cmd}")
+        if VOICE.exists():
+            sh(str(VOICE), cmd)
+        else:
+            notify(f"{VOICE} is missing", "Discord voice")
+
+    def share_tick(self, now):
+        t0 = self.pressed.get("SHARE")
+        if t0 is not None and not self.share_held and now - t0 >= SHARE_HOLD:
+            self.share_held, self.share_taps, self.share_until = True, 0, 0.0
+            self.voice("toggle")
+        if self.share_until and now >= self.share_until and "SHARE" not in self.pressed:
+            taps, self.share_taps, self.share_until = self.share_taps, 0, 0.0
+            if taps == 1:
+                if self.active:
+                    self.out.tap([], K["SYSRQ"])          # screenshot, desktop mode only
+            elif taps == 2:
+                self.voice("mute")
+            elif taps >= 3:
+                self.voice("deafen")
+
     def press(self, name, now):
         self.pressed[name] = now
+        if name == "SHARE":
+            self.share_held = False
+            if self.fn:
+                self.fn_used = True
+            return
         if name == "GUIDE":
-            self.guide_fired = False
+            # While a game has the controller, the Xbox button is the game's (ConsolePort binds
+            # it to the WoW game menu): a long press there must not switch desktop mode off.
+            self.guide_fired = self.game is not None
             return
         if not self.active:
             return
@@ -462,6 +565,12 @@ class Daemon:
 
     def release(self, name, now):
         t0 = self.pressed.pop(name, now)
+        if name == "SHARE":
+            if not self.share_held:
+                self.share_taps += 1
+                self.share_until = now + SHARE_TAPS
+            self.share_held = False
+            return
         if name == "GUIDE":
             if not self.guide_fired and self.active and now - t0 < 0.6:
                 self.out.tap([], K["META"])
@@ -514,7 +623,8 @@ class Daemon:
         if "GUIDE" in self.pressed and not self.guide_fired \
                 and now - self.pressed["GUIDE"] >= GUIDE_HOLD:
             self.guide_fired = True
-            self.toggle(not self.enabled)
+            self.toggle(not self.enabled, "Xbox button held")
+        self.share_tick(now)
         if not self.active:
             return
         if self.switching and now > self.switching and "LB" not in self.held \
@@ -552,6 +662,7 @@ class Daemon:
 
     def run(self):
         self.state_mtime = STATE.stat().st_mtime if STATE.exists() else 0.0
+        self.check_game(time.monotonic())   # before the first grab: a running game keeps it
         last = time.monotonic()
         next_pad_check = 0.0
         while True:
@@ -559,6 +670,8 @@ class Daemon:
             if now >= next_pad_check:
                 self.check_pad()
                 self.check_state_file()
+                if self.active and not self.pad.grabbed:
+                    self.pad.grab(True)
                 next_pad_check = now + 1.0
             self.check_game(now)
             if self.pad is None:

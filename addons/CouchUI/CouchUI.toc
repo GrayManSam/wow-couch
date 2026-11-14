@@ -2,6 +2,6 @@
 ## Title: CouchUI
 ## Notes: Couch (TV + controller) vs Desk (monitor + keyboard/mouse): layout, chat size, UI scale, macros.
 ## Author: GrayManSam
-## Version: 2.2
+## Version: 2.3
 ## SavedVariables: CouchUIDB
 CouchUI.lua

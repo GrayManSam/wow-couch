@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Discord voice overlay (Discover)
+Comment=Shows who is in your Discord voice channel, only while you are in voice
+Exec=@HOME@/.local/bin/discord-overlay
+Icon=io.github.trigg.discover_overlay
+X-GNOME-Autostart-Delay=10
+NoDisplay=true
