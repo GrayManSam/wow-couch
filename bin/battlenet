@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Battle.net / World of Warcraft via GE-Proton + umu-launcher
+#   battlenet            -> open Battle.net
+#   battlenet --wow      -> open Battle.net and auto-launch WoW Forever
+#   battlenet --kill     -> force-stop everything (Battle.net, Agent, WoW, wineserver)
+#   battlenet --install  -> run the Battle.net installer
+#
+# Watchdog: Battle.net "closes" to a system tray GNOME doesn't have, so it used to
+# linger invisibly (Agent.exe + wineserver + container, ~1.5GB) and block relaunches.
+# While a session runs, this script watches for a visible Battle.net window or a
+# running Wow.exe; once neither exists for IDLE_LIMIT seconds the whole session is
+# killed. In --wow mode, the session also ends as soon as WoW exits.
+export WINEPREFIX="$HOME/Games/battlenet"
+export PROTONPATH="$HOME/.local/share/Steam/compatibilitytools.d/GE-Proton11-12-x86_64"
+export GAMEID="umu-battlenet"
+export STORE="battlenet"
+export PROTON_ENABLE_WAYLAND="${PROTON_ENABLE_WAYLAND:-0}"   # X11/XWayland: winewayland draws Battle.net over the GNOME overview. Sharp 133% via mutter xwayland-native-scaling + LogPixels=128
+export PROTON_USE_XALIA=0             # Xalia was crash-looping and polling windows (sluggish UI)
+export PROTON_USE_NTSYNC=1              # kernel ntsync, smoother on kernel 6.14+
+LAUNCHER="$WINEPREFIX/drive_c/Program Files (x86)/Battle.net/Battle.net Launcher.exe"
+WINESERVER="$PROTONPATH/files/bin/wineserver"
+WM_CLASS="steam_app_battlenet"
+IDLE_LIMIT=10        # seconds with no visible window and no WoW before killing
+STARTUP_GRACE=120    # seconds to wait for the first window to appear
+
+if [[ "$1" == "--install" || ( "$1" != "--kill" && ! -f "$LAUNCHER" ) ]]; then
+  exec gamemoderun "$HOME/.local/bin/umu-run" "${2:-$HOME/Downloads/Battle.net-Setup.exe}"
+fi
+
+notify() { command -v notify-send >/dev/null && notify-send -i "$HOME/.local/share/icons/battlenet.png" "Battle.net" "$1"; }
+
+# Anything still running out of this prefix (Battle.net, Agent, WoW, CEF helpers, wine services)
+session_pids() { pgrep -f "Battle\.net|Wow\.exe|Agent\.exe|umu-run .*battlenet|$WINEPREFIX" | grep -vx "$$"; }
+
+stop_session() {
+  # Each umu-run is its own container, so a running Battle.net can't take commands
+  # from a new launch. Shut the whole session down: polite first, then forced.
+  "$WINESERVER" -k 2>/dev/null
+  pkill -f "umu-run .*Battle\.net" 2>/dev/null
+  for _ in {1..10}; do [[ -z "$(session_pids)" ]] && return 0; sleep 0.5; done
+  "$WINESERVER" -k9 2>/dev/null
+  session_pids | xargs -r kill -9 2>/dev/null
+  sleep 0.5
+}
+
+# True if any Battle.net/WoW X11 window is actually shown (normal or minimized).
+# Tray-hidden windows are withdrawn and have no WM_STATE.
+window_visible() {
+  local w
+  for w in $(xdotool search --class "$WM_CLASS" 2>/dev/null); do
+    xprop -id "$w" WM_STATE 2>/dev/null | grep -qE 'window state: (Normal|Iconic)' && return 0
+  done
+  return 1
+}
+
+wow_running() { pgrep -f 'Wow\.exe' >/dev/null; }
+
+watchdog() {
+  local mode="$1" child="$2" start=$SECONDS seen=0 idle=0 wow_seen=0
+  while kill -0 "$child" 2>/dev/null; do
+    sleep 2
+    if wow_running; then
+      seen=1; wow_seen=1; idle=0; continue
+    fi
+    if [[ "$mode" == wow && $wow_seen == 1 ]]; then
+      idle=$((idle + 2))                      # WoW closed: wind down shortly after
+    elif window_visible; then
+      seen=1; idle=0; continue
+    elif (( seen || SECONDS - start > STARTUP_GRACE )); then
+      idle=$((idle + 2))
+    fi
+    if (( idle >= IDLE_LIMIT )); then
+      stop_session
+      break
+    fi
+  done
+  # umu-run finished on its own: make sure nothing it started is left behind
+  [[ -n "$(session_pids)" ]] && stop_session
+}
+
+mode=launcher
+case "$1" in
+  --kill)
+    stop_session
+    [[ -z "$(session_pids)" ]] && notify "Battle.net stopped." || notify "Some Battle.net processes would not die."
+    exit 0 ;;
+  --wow)
+    shift; mode=wow
+    if wow_running; then notify "WoW is already running."; exit 0; fi
+    if pgrep -f 'Battle\.net\.exe' >/dev/null; then stop_session; fi
+    set -- --exec="launch WoWF" "$@" ;;   # game family ID is case-sensitive: "wowf" silently falls back to W3
+  *)
+    if pgrep -f 'Battle\.net\.exe' >/dev/null; then
+      if window_visible || wow_running; then notify "Battle.net is already open."; exit 0; fi
+      stop_session   # stale, invisible session left behind: clear it and relaunch
+    fi ;;
+esac
+
+# Couch (TV + controller) vs desk profile: graphics + which UI addons load
+"$HOME/.local/bin/couch" wow-prep >/dev/null 2>&1
+gamemoderun "$HOME/.local/bin/umu-run" "$LAUNCHER" "$@" &
+child=$!
+trap 'stop_session; exit 0' TERM INT HUP
+watchdog "$mode" "$child"
+wait "$child" 2>/dev/null
+exit 0

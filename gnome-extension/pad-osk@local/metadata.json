@@ -1,0 +1,7 @@
+{
+  "uuid": "pad-osk@local",
+  "name": "Pad on-screen keyboard",
+  "description": "Lets the pad controller tool open/close GNOME's on-screen keyboard over D-Bus (org.local.PadOsk).",
+  "shell-version": ["49"],
+  "version": 1
+}

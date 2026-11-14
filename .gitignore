@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.bak*
+# never commit your local state
+config.json
+screencast-token
+*.status
+WoWCombatLog*.txt

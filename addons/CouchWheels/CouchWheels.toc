@@ -1,0 +1,8 @@
+## Interface: 16001
+## Title: CouchWheels
+## Notes: Fills Easy Controller's wheels with every spell, ability and profession you know, and keeps them up to date.
+## Author: GrayManSam
+## Version: 1.0
+## Dependencies: EasyController
+## SavedVariables: CouchWheelsDB
+CouchWheels.lua

@@ -1,0 +1,9 @@
+# WoW CVars applied before launch in couch mode (name value)
+renderScale 0.5
+ResampleQuality 3
+vsync 1
+maxFPS 60
+GxMaximize 1
+GamePadEnable 1
+SoftTargetEnemy 1
+SoftTargetInteract 1

@@ -1,0 +1,312 @@
+#!/usr/bin/python3 -I
+"""couch - switch between couch mode (LG TV + controller) and desk mode (monitor + keyboard/mouse).
+
+  couch            show the current profile and connected screens
+  couch on | off   force couch / desk mode now
+  couch auto       go back to automatic (TV plugged in = couch)
+  couch wow-prep   apply the current profile to WoW (the battlenet launcher runs this)
+  couch daemon     background service (systemd: couchmode.service)
+
+Couch mode: TV becomes the only screen (4K, 200% scale, best refresh up to 120Hz),
+sound moves to the TV, controller desktop mode (pad) turns on, and WoW starts with
+Easy Controller + CouchWheels + couch graphics. Unplugging the TV puts everything back.
+A screen counts as the TV if its EDID is at least 100 cm wide or its name contains "TV".
+Edit WoW per-profile settings in ~/.config/gameprofile/wow-couch.cvars / wow-desk.cvars.
+"""
+import os
+import json
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CONF = Path.home() / ".config/gameprofile"
+OVERRIDE = CONF / "override"            # auto | couch | desk
+CURRENT = CONF / "current"              # what is applied right now
+SAVED_SINK = CONF / "desk-audio-sink"
+WOW = Path(os.environ.get("WOW_DIR") or Path.home() / "Games/battlenet/drive_c/Program Files (x86)/World of Warcraft/_forever_")
+PAD = Path.home() / ".local/bin/pad"
+LAPTOP_MODE = ("eDP-1", "2560x1600", 1.3333333730697632)
+
+# Easy Controller - Forever works WITH the game's own gamepad UI; ConsolePort taints it in
+# Forever ("execution tainted by 'ConsolePort'"), so it is never enabled in either mode.
+COUCH_ADDONS_ON = ["EasyController", "CouchWheels"]
+DESK_ADDONS_ON = ["Bartender4"]
+ALWAYS_ON = ["CouchUI", "CouchLights"]          # profile switcher + room-light bridge
+ALWAYS_OFF = ["ConsolePort", "ConsolePort_Bar", "ConsolePort_Config", "ConsolePort_Cursor",
+              "ConsolePort_Keyboard", "ConsolePort_Menu", "ConsolePort_Rings",
+              "ConsolePort_Target", "ConsolePort_World"]
+
+DEFAULT_CVARS = {
+    # TV: 4K output, render at 50% (1080p) and FSR-upscale; the 860M can't render native 4K.
+    "couch": {"renderScale": "0.5", "ResampleQuality": "3", "vsync": "1", "maxFPS": "60",
+              "GxMaximize": "1", "GamePadEnable": "1", "SoftTargetEnemy": "1",
+              "SoftTargetInteract": "1"},
+    # Desk: the settings tuned on 2026-11-09 for the laptop panel / monitor.
+    "desk": {"renderScale": "0.75333333015442", "ResampleQuality": "3", "vsync": "0",
+             "maxFPS": "60", "GxMaximize": "1", "GamePadEnable": "1"},
+}
+
+
+def run(*cmd, timeout=15):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return subprocess.CompletedProcess(cmd, 1, "", "")
+
+
+def notify(body):
+    run("notify-send", "-a", "couch", "-i", "video-display", "-e", "Couch mode", body)
+
+
+def read(path, default=""):
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return default
+
+
+def write(path, text):
+    CONF.mkdir(parents=True, exist_ok=True)
+    path.write_text(text + "\n")
+
+
+# ---- screens ------------------------------------------------------------------------
+def edid_info(edid):
+    """(name, width_cm) from a raw EDID blob."""
+    if len(edid) < 128:
+        return "", 0
+    name = ""
+    for off in (54, 72, 90, 108):
+        d = edid[off:off + 18]
+        if d[0:3] == b"\0\0\0" and d[3] == 0xFC:
+            name = d[5:18].split(b"\n")[0].decode("ascii", "replace").strip()
+    return name, edid[21]
+
+
+def external_screens():
+    """[(connector, name, width_cm, is_tv)] for connected non-laptop outputs."""
+    out = []
+    for st in sorted(Path("/sys/class/drm").glob("card*-*/status")):
+        conn = st.parent.name.split("-", 1)[1]
+        if conn.startswith(("eDP", "Writeback")) or read(st) != "connected":
+            continue
+        try:
+            name, width = edid_info((st.parent / "edid").read_bytes())
+        except OSError:
+            name, width = "", 0
+        out.append((conn, name, width, width >= 100 or "TV" in name.upper()))
+    return out
+
+
+def best_mode(connector):
+    """Highest-refresh 3840x2160 mode the TV offers (falls back to the largest mode)."""
+    r = run("gdctl", "show", "--modes")
+    block, modes = False, []
+    for line in r.stdout.splitlines():
+        if re.search(r"Monitor \S+", line):
+            block = f"Monitor {connector} " in line + " "
+        elif block:
+            m = re.search(r"(\d+)x(\d+)@([\d.]+)", line)
+            if m:
+                modes.append((int(m[1]), int(m[2]), float(m[3]), m[0]))
+    if not modes:
+        return None
+    uhd = [m for m in modes if m[0] == 3840 and m[1] == 2160]
+    pool = uhd or modes
+    return max(pool, key=lambda m: (m[0] * m[1], m[2]))[3]
+
+
+def tv_display(connector):
+    mode = best_mode(connector)
+    cmd = ["gdctl", "set", "--logical-monitor", "--primary", "--scale", "2",
+           "--monitor", connector]
+    if mode:
+        cmd += ["--mode", mode]
+    r = run(*cmd)
+    return mode, r.returncode == 0, r.stderr.strip()
+
+
+def laptop_display():
+    conn, res, scale = LAPTOP_MODE
+    r = run("gdctl", "show", "--modes")
+    mode = None
+    for m in re.findall(rf"{res}@[\d.]+", r.stdout):
+        if mode is None or float(m.split("@")[1]) > float(mode.split("@")[1]):
+            mode = m
+    cmd = ["gdctl", "set", "--logical-monitor", "--primary", "--scale", str(scale),
+           "--monitor", conn] + (["--mode", mode] if mode else [])
+    run(*cmd)
+
+
+# ---- audio --------------------------------------------------------------------------
+def pactl_json(*what):
+    r = run("pactl", "-f", "json", "list", *what)
+    try:
+        return json.loads(r.stdout)
+    except ValueError:
+        return []
+
+
+def tv_audio():
+    for card in pactl_json("cards"):
+        if any(p.get("available") and n == "HiFi" for n, p in card["profiles"].items()) \
+                and card["active_profile"] != "HiFi" and "c1_00.1" in card["name"]:
+            run("pactl", "set-card-profile", card["name"], "HiFi")
+            time.sleep(1)
+    for sink in pactl_json("sinks"):
+        ports = sink.get("ports", [])
+        hdmi = "hdmi" in sink["name"].lower() or "c1_00.1" in sink["name"]
+        if hdmi and any(p.get("availability") != "not available" for p in ports):
+            cur = run("pactl", "get-default-sink").stdout.strip()
+            if cur and "c1_00.1" not in cur:
+                write(SAVED_SINK, cur)
+            run("pactl", "set-default-sink", sink["name"])
+            for si in pactl_json("sink-inputs"):
+                run("pactl", "move-sink-input", str(si["index"]), sink["name"])
+            return sink.get("description", sink["name"])
+    return None
+
+
+def desk_audio():
+    sink = read(SAVED_SINK)
+    if sink and run("pactl", "set-default-sink", sink).returncode == 0:
+        for si in pactl_json("sink-inputs"):
+            run("pactl", "move-sink-input", str(si["index"]), sink)
+
+
+# ---- profiles -----------------------------------------------------------------------
+def wanted_profile():
+    o = read(OVERRIDE, "auto")
+    if o in ("couch", "desk"):
+        return o, None
+    tv = next((s for s in external_screens() if s[3]), None)
+    return ("couch" if tv else "desk"), tv
+
+
+def apply(profile, tv, announce=True):
+    prev = read(CURRENT, "desk")
+    if profile == "couch":
+        if tv is None:
+            tv = next((s for s in external_screens() if s[3]), None)
+        msg = []
+        if tv:
+            mode, ok, err = tv_display(tv[0])
+            msg.append(f"{tv[1] or tv[0]} at {mode or 'default mode'}"
+                       + ("" if ok else f" (display change failed: {err[:80]})"))
+            snd = tv_audio()
+            if snd:
+                msg.append("sound → TV")
+        if prev != "couch":
+            run(str(PAD), "on")
+            msg.append("controller desktop mode on")
+        write(CURRENT, "couch")
+        if announce:
+            notify("Couch mode: " + ", ".join(msg or ["on (no TV detected)"]))
+    else:
+        if prev == "couch":
+            if not any(s[3] for s in external_screens()):
+                pass                      # TV unplugged: mutter already moved to what's left
+            else:
+                laptop_display()
+            desk_audio()
+            run(str(PAD), "off")
+        write(CURRENT, "desk")
+        if announce and prev == "couch":
+            notify("Desk mode: laptop/monitor, keyboard + mouse")
+
+
+def daemon():
+    last = None
+    while True:
+        profile, tv = wanted_profile()
+        key = (profile, tv[0] if tv else None)
+        if key != last:
+            if last is not None or profile != read(CURRENT, "desk"):
+                time.sleep(2)             # let mutter finish its own hotplug reconfigure
+                apply(profile, tv)
+            last = key
+        time.sleep(2)
+
+
+# ---- WoW ----------------------------------------------------------------------------
+def load_cvars(profile):
+    f = CONF / f"wow-{profile}.cvars"
+    if not f.exists():
+        CONF.mkdir(parents=True, exist_ok=True)
+        f.write_text(f"# WoW CVars applied before launch in {profile} mode (name value)\n"
+                     + "".join(f"{k} {v}\n" for k, v in DEFAULT_CVARS[profile].items()))
+    out = {}
+    for line in f.read_text().splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and not line.startswith("#"):
+            out[parts[0]] = parts[1].strip().strip('"')
+    return out
+
+
+def wow_prep():
+    profile = read(CURRENT) or wanted_profile()[0]
+    cfg = WOW / "WTF/Config.wtf"
+    if not cfg.exists():
+        return
+    # WoW writes CRLF line endings; keep them (normalizing any LF-only lines too).
+    text = cfg.read_bytes().decode("utf-8", "replace").replace("\r\n", "\n")
+    for k, v in load_cvars(profile).items():
+        line = f'SET {k} "{v}"'
+        text, n = re.subn(rf'^SET {re.escape(k)} ".*"$', line, text, flags=re.M)
+        if not n:
+            text = text.rstrip("\n") + "\n" + line + "\n"
+    cfg.write_bytes(text.replace("\n", "\r\n").encode())
+    on = COUCH_ADDONS_ON if profile == "couch" else DESK_ADDONS_ON
+    off = DESK_ADDONS_ON if profile == "couch" else COUCH_ADDONS_ON
+    installed = {p.name for p in (WOW / "Interface/AddOns").iterdir()} \
+        if (WOW / "Interface/AddOns").exists() else set()
+    for addons in (WOW / "WTF/Account").glob("*/*/*/AddOns.txt"):
+        lines = addons.read_text().splitlines()
+        state = dict(ln.split(": ", 1) for ln in lines if ": " in ln)
+        for a in on:
+            if a in installed:
+                state[a] = "enabled"
+        for a in off:
+            if a in installed:
+                state[a] = "disabled"
+        for a in ALWAYS_ON:
+            if a in installed:
+                state[a] = "enabled"
+        for a in ALWAYS_OFF:
+            if a in state or a in installed:
+                state[a] = "disabled"
+        addons.write_text("".join(f"{k}: {v}\n" for k, v in state.items()))
+    print(f"WoW set up for {profile} mode")
+
+
+def show():
+    o = read(OVERRIDE, "auto")
+    print(f"🛋  profile: {read(CURRENT, 'desk')}  (mode: {o})")
+    for conn, name, width, tv in external_screens():
+        print(f"   {conn}: {name or 'unknown'} {width} cm{'  ← TV' if tv else ''}")
+    svc = run("systemctl", "--user", "is-active", "couchmode").stdout.strip()
+    if svc != "active":
+        print(f"   service not running ({svc})")
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if arg == "daemon":
+        daemon()
+    elif arg in ("on", "off", "auto"):
+        write(OVERRIDE, {"on": "couch", "off": "desk", "auto": "auto"}[arg])
+        profile, tv = wanted_profile()
+        apply(profile, tv)
+        show()
+    elif arg == "wow-prep":
+        wow_prep()
+    elif arg == "status":
+        show()
+    else:
+        print(__doc__.strip())
+
+
+if __name__ == "__main__":
+    main()

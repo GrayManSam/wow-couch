@@ -1,0 +1,7 @@
+# WoW CVars applied before launch in desk mode (name value)
+renderScale 0.75333333015442
+ResampleQuality 3
+vsync 0
+maxFPS 60
+GxMaximize 1
+GamePadEnable 1

@@ -1,0 +1,646 @@
+#!/usr/bin/python3 -I
+"""pad - drive the GNOME desktop with an Xbox controller.
+
+  pad            toggle desktop mode on/off
+  pad on | off   set it explicitly (remembered across reboots)
+  pad status     show mode, controller, and whether a game paused it
+  pad keys       print the button map
+  pad test       print raw controller buttons for 20s (run 'pad off' first)
+  pad daemon     the background service (systemd: padmode.service)
+  pad auto on|off  turn desktop mode on whenever a controller connects (default on)
+
+From the controller itself: hold the Xbox button for 1 second to toggle.
+Desktop mode pauses itself while a game runs (patterns in ~/.config/padmode/games),
+so WoW / Steam games get the controller to themselves.
+Stdlib only: reads /dev/input/eventN, writes a virtual mouse+keyboard via /dev/uinput.
+"""
+import fcntl
+import os
+import select
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CONF = Path.home() / ".config/padmode"
+STATE = CONF / "state"
+GAMES = CONF / "games"
+AUTO_ON = CONF / "auto-on-connect"   # "on" = enable desktop mode whenever a controller connects
+STATUS = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "padmode.status"
+DEFAULT_GAMES = ["Wow.exe", "SteamLaunch", "gamescope"]
+
+# ---- tuning -------------------------------------------------------------------------
+POINTER_MAX = 1700.0     # px/s at full stick
+PRECISION = 0.3          # pointer multiplier in precision mode (left-stick click)
+CURVE = 2.2              # >1 = finer control near center
+SCROLL_MAX = 2400.0      # hi-res wheel units/s (120 = one notch)
+DEADZONE = 0.12
+TICK = 1 / 125
+GUIDE_HOLD = 1.0         # seconds to toggle desktop mode
+SWITCH_LINGER = 0.9      # Alt stays held this long after LB/RB so repeated presses cycle
+
+# ---- kernel constants ---------------------------------------------------------------
+EV_SYN, EV_KEY, EV_REL, EV_ABS, EV_FF = 0x00, 0x01, 0x02, 0x03, 0x15
+REL_X, REL_Y, REL_HWHEEL, REL_WHEEL, REL_WHEEL_HI, REL_HWHEEL_HI = 0, 1, 6, 8, 0x0B, 0x0C
+ABS_X, ABS_Y, ABS_Z, ABS_RX, ABS_RY, ABS_RZ = 0, 1, 2, 3, 4, 5
+ABS_GAS, ABS_BRAKE, ABS_HAT0X, ABS_HAT0Y = 0x09, 0x0A, 0x10, 0x11
+BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
+K = dict(ESC=1, MINUS=12, EQUAL=13, TAB=15, W=17, ENTER=28, CTRL=29, SHIFT=42, ALT=56,
+         F4=62, SYSRQ=99, UP=103, LEFT=105, RIGHT=106, DOWN=108, MUTE=113, VOLDOWN=114,
+         VOLUP=115, META=125, NEXT=163, PLAY=164, PREV=165)
+BUTTONS = {0x130: "A", 0x131: "B", 0x133: "X", 0x134: "Y", 0x136: "LB", 0x137: "RB",
+           0x138: "LT", 0x139: "RT", 0x13A: "VIEW", 0x13B: "MENU", 0x13C: "GUIDE",
+           0x13D: "LS", 0x13E: "RS", 167: "SHARE", 0x220: "DU", 0x221: "DD", 0x222: "DL",
+           0x223: "DR"}
+EVENT = struct.Struct("llHHi")
+EVIOCGRAB, EVIOCSFF, EVIOCRMFF = 0x40044590, 0x40304580, 0x40044581
+UI_SET_EVBIT, UI_SET_KEYBIT, UI_SET_RELBIT = 0x40045564, 0x40045565, 0x40045566
+UI_DEV_CREATE, UI_DEV_DESTROY = 0x5501, 0x5502
+
+# ---- button map ---------------------------------------------------------------------
+# hold = press/release follows the button; tap = mods+key on press; call = run a helper.
+BASE = {
+    "A": ("hold", BTN_LEFT), "X": ("hold", BTN_RIGHT), "B": ("hold", K["ESC"]),
+    "Y": ("call", "osk"), "RS": ("hold", BTN_MIDDLE), "LS": ("call", "precision"),
+    "MENU": ("hold", K["ENTER"]), "SHARE": ("tap", [], K["SYSRQ"]),
+    "LB": ("switch", -1), "RB": ("switch", 1),
+    "LT": ("tap", [K["CTRL"], K["SHIFT"]], K["TAB"]), "RT": ("tap", [K["CTRL"]], K["TAB"]),
+    "DU": ("hold", K["UP"]), "DD": ("hold", K["DOWN"]),
+    "DL": ("hold", K["LEFT"]), "DR": ("hold", K["RIGHT"]),
+}
+FN = {  # while View is held
+    "DU": ("tap", [], K["VOLUP"]), "DD": ("tap", [], K["VOLDOWN"]),
+    "DL": ("tap", [], K["PREV"]), "DR": ("tap", [], K["NEXT"]),
+    "A": ("tap", [], K["PLAY"]), "MENU": ("tap", [], K["MUTE"]),
+    "B": ("tap", [K["ALT"]], K["F4"]), "X": ("tap", [K["CTRL"]], K["W"]),
+    "Y": ("call", "audio"),
+    "LB": ("tap", [K["ALT"]], K["LEFT"]), "RB": ("tap", [K["ALT"]], K["RIGHT"]),
+    "LT": ("tap", [K["CTRL"]], K["MINUS"]), "RT": ("tap", [K["CTRL"]], K["EQUAL"]),
+}
+KEYS_HELP = """\
+ DESKTOP MODE  (hold Xbox button 1s to toggle, or type: pad)
+ Left stick ..... mouse pointer      L-stick click .. precision on/off
+ Right stick .... scroll             R-stick click .. middle click
+ A .............. left click / drag  B .............. Esc (back/cancel)
+ X .............. right click        Y .............. on-screen keyboard
+ D-pad .......... arrow keys         Menu (≡) ....... Enter
+ LB / RB ........ prev / next window (tap again to keep cycling, A picks)
+ LT / RT ........ prev / next tab    Xbox tap ....... Activities / search
+ Share .......... screenshot         View tap ....... show this help
+
+ HOLD VIEW (⧉) +
+ D-pad ↑/↓ ...... volume             D-pad ←/→ ...... prev / next track
+ A .............. play / pause       Menu ........... mute
+ Y .............. switch audio output (runs: audio)
+ B .............. close window       X .............. close tab
+ LB / RB ........ browser back / fwd LT / RT ........ zoom out / in"""
+NOTIFY_HELP = ("A click · X right-click · B Esc · Y keyboard · ≡ Enter\n"
+               "LB/RB windows · LT/RT tabs · Xbox overview · L-click precision\n"
+               "View+: ↑↓ vol · ←→ track · A play · Y audio · B close · X tab")
+
+
+def sh(*cmd):
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError:
+        pass
+
+
+def notify(body, title="Controller"):
+    sh("notify-send", "-a", "pad", "-i", "input-gaming", "-e",
+       "-h", "string:x-canonical-private-synchronous:pad", title, body)
+
+
+def read_state():
+    try:
+        return STATE.read_text().strip() == "on"
+    except OSError:
+        return False
+
+
+def write_state(on):
+    CONF.mkdir(parents=True, exist_ok=True)
+    STATE.write_text("on\n" if on else "off\n")
+
+
+def game_patterns():
+    if not GAMES.exists():
+        CONF.mkdir(parents=True, exist_ok=True)
+        GAMES.write_text("# one substring per line; desktop mode pauses while a matching "
+                         "process runs\n" + "\n".join(DEFAULT_GAMES) + "\n")
+    lines = GAMES.read_text().splitlines()
+    return [ln.strip().encode() for ln in lines if ln.strip() and not ln.startswith("#")]
+
+
+def auto_on():
+    if not AUTO_ON.exists():
+        CONF.mkdir(parents=True, exist_ok=True)
+        AUTO_ON.write_text("on\n")
+    return AUTO_ON.read_text().strip() != "off"
+
+
+def big_picture_open():
+    """Steam Big Picture drives the controller itself; pad would double every input."""
+    try:
+        r = subprocess.run(["xdotool", "search", "--onlyvisible", "--name", "Steam Big Picture"],
+                           capture_output=True, text=True, timeout=3)
+        return bool(r.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def running_game(patterns):
+    me = str(os.getpid())
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or pid == me:
+            continue
+        try:
+            cmd = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            continue
+        for p in patterns:
+            if p in cmd:
+                return p.decode()
+    return None
+
+
+# ---- devices ------------------------------------------------------------------------
+def find_controller():
+    for ev in sorted(Path("/sys/class/input").glob("event*")):
+        try:
+            name = (ev / "device/name").read_text().strip()
+            keybits = (ev / "device/capabilities/key").read_text().split()
+        except OSError:
+            continue
+        # must be a gamepad (BTN_SOUTH = 0x130 = word 4, bit 48)
+        if "xbox" in name.lower() and len(keybits) >= 5 and (int(keybits[-5], 16) >> 48) & 1:
+            return f"/dev/input/{ev.name}", name
+    return None, None
+
+
+class Pad:
+    def __init__(self, path):
+        self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        absbits = int(Path(f"/sys/class/input/{Path(path).name}/device/capabilities/abs")
+                      .read_text().split()[-1], 16)
+        xpad = bool(absbits & (1 << ABS_RX))          # USB xpad vs Bluetooth hid-microsoft
+        self.rx, self.ry = (ABS_RX, ABS_RY) if xpad else (ABS_Z, ABS_RZ)
+        self.lt, self.rt = (ABS_Z, ABS_RZ) if xpad else (ABS_BRAKE, ABS_GAS)
+        self.info = {}
+        for code in (ABS_X, ABS_Y, self.rx, self.ry, self.lt, self.rt):
+            buf = bytearray(24)
+            try:
+                fcntl.ioctl(self.fd, 0x80184540 + code, buf, True)
+                _, lo, hi, *_ = struct.unpack("iiiiii", buf)
+                self.info[code] = (lo, hi)
+            except OSError:
+                self.info[code] = (-32768, 32767)
+        self.grabbed = False
+        self.ff_id = -1
+
+    def norm(self, code, val):
+        lo, hi = self.info.get(code, (-32768, 32767))
+        if code in (self.lt, self.rt):
+            return (val - lo) / max(1, hi - lo)
+        mid = (lo + hi) / 2
+        return max(-1.0, min(1.0, (val - mid) / max(1, (hi - lo) / 2)))
+
+    def grab(self, on):
+        if on != self.grabbed:
+            try:
+                fcntl.ioctl(self.fd, EVIOCGRAB, int(on))
+                self.grabbed = on
+            except OSError:
+                pass
+
+    def rumble(self, strong, weak, ms):
+        try:
+            if self.ff_id >= 0:
+                fcntl.ioctl(self.fd, EVIOCRMFF, self.ff_id)
+            buf = bytearray(struct.pack("<HhHHHHH2xHH28x", 0x50, -1, 0, 0, 0, ms, 0,
+                                        strong, weak))
+            fcntl.ioctl(self.fd, EVIOCSFF, buf, True)
+            self.ff_id = struct.unpack_from("<h", buf, 2)[0]
+            os.write(self.fd, EVENT.pack(0, 0, EV_FF, self.ff_id, 1))
+        except OSError:
+            pass
+
+    def close(self):
+        self.grab(False)
+        os.close(self.fd)
+
+
+class VirtualInput:
+    def __init__(self):
+        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        for ev in (EV_KEY, EV_REL):
+            fcntl.ioctl(self.fd, UI_SET_EVBIT, ev)
+        for code in list(range(1, 249)) + [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE]:
+            fcntl.ioctl(self.fd, UI_SET_KEYBIT, code)
+        for code in (REL_X, REL_Y, REL_WHEEL, REL_HWHEEL, REL_WHEEL_HI, REL_HWHEEL_HI):
+            fcntl.ioctl(self.fd, UI_SET_RELBIT, code)
+        dev = struct.pack("80sHHHHi", b"pad desktop controller", 0x06, 0x1209, 0x5AD0, 1, 0)
+        os.write(self.fd, dev + b"\0" * (4 * 64 * 4))
+        fcntl.ioctl(self.fd, UI_DEV_CREATE)
+        self.down = set()
+
+    def emit(self, etype, code, value):
+        os.write(self.fd, EVENT.pack(0, 0, etype, code, value))
+
+    def sync(self):
+        self.emit(EV_SYN, 0, 0)
+
+    def key(self, code, down):
+        if down == (code in self.down):
+            return
+        (self.down.add if down else self.down.discard)(code)
+        self.emit(EV_KEY, code, int(down))
+        self.sync()
+
+    def tap(self, mods, code):
+        for m in mods:
+            self.key(m, True)
+        self.key(code, True)
+        self.key(code, False)
+        for m in reversed(mods):
+            self.key(m, False)
+
+    def release_all(self):
+        for code in list(self.down):
+            self.key(code, False)
+
+    def close(self):
+        self.release_all()
+        fcntl.ioctl(self.fd, UI_DEV_DESTROY)
+        os.close(self.fd)
+
+
+# ---- daemon -------------------------------------------------------------------------
+class Daemon:
+    def __init__(self):
+        self.out = VirtualInput()
+        self.pad = None
+        self.pad_name = None
+        self.enabled = read_state()
+        self.state_mtime = 0.0
+        self.game = None
+        self.next_game_check = 0.0
+        self.reset()
+
+    def reset(self):
+        self.axes = {}
+        self.held = {}          # input name -> action taken at press time
+        self.pressed = {}       # input name -> press timestamp
+        self.fn = False
+        self.fn_used = False
+        self.guide_fired = False
+        self.precision = False
+        self.switching = 0.0    # time Alt should be released (0 = not switching)
+        self.acc = [0.0, 0.0, 0.0, 0.0]
+        self.legacy = [0.0, 0.0]
+
+    @property
+    def active(self):
+        return self.enabled and self.game is None and self.pad is not None
+
+    def set_status(self):
+        if self.pad is None:
+            s = "waiting for controller"
+        elif not self.enabled:
+            s = "off"
+        elif self.game:
+            s = f"paused (game running: {self.game})"
+        else:
+            s = "on" + (" (precision)" if self.precision else "")
+        try:
+            STATUS.write_text(f"{s}\n{self.pad_name or ''}\n")
+        except OSError:
+            pass
+
+    def deactivate(self):
+        self.out.release_all()
+        self.held.clear()
+        self.switching = 0.0
+        if self.pad:
+            self.pad.grab(False)
+
+    def apply(self, was_active, announce=None):
+        if was_active and not self.active:
+            self.deactivate()
+        elif self.active and not was_active:
+            self.pad.grab(True)
+        if announce:
+            notify(*announce)
+        self.set_status()
+
+    def toggle(self, on):
+        was = self.active
+        self.enabled = on
+        write_state(on)
+        self.state_mtime = STATE.stat().st_mtime
+        if self.pad:
+            self.pad.rumble(0xC000, 0x8000, 180) if on else self.pad.rumble(0, 0x6000, 110)
+        if on and self.game:
+            msg = (f"Desktop mode on — paused while {self.game} runs", "Controller")
+        elif on:
+            msg = ("Desktop mode ON\nView tap = button help · hold Xbox 1s = off",
+                   "Controller")
+        else:
+            msg = ("Desktop mode off", "Controller")
+        self.apply(was, msg)
+
+    # -- polling helpers --
+    def check_state_file(self):
+        try:
+            m = STATE.stat().st_mtime
+        except OSError:
+            return
+        if m != self.state_mtime:
+            self.state_mtime = m
+            on = read_state()
+            if on != self.enabled:
+                self.toggle(on)
+
+    def check_game(self, now):
+        if now < self.next_game_check:
+            return
+        self.next_game_check = now + 2.0
+        game = running_game(game_patterns())
+        if game is None and big_picture_open():
+            game = "Steam Big Picture"
+        if game != self.game:
+            was = self.active
+            self.game = game
+            msg = None
+            if self.enabled:
+                msg = ((f"Paused for {game}", "Controller") if game
+                       else ("Game closed — desktop mode back on", "Controller"))
+            self.apply(was, msg)
+
+    def check_pad(self):
+        if self.pad is not None and not Path(f"/proc/self/fd/{self.pad.fd}").exists():
+            self.pad = None
+        if self.pad is None:
+            path, name = find_controller()
+            if path:
+                try:
+                    self.pad, self.pad_name = Pad(path), name
+                    self.reset()
+                    if auto_on() and not self.enabled:
+                        self.toggle(True)          # controller connected (USB or Bluetooth)
+                    elif self.enabled and self.game is None:
+                        self.pad.grab(True)
+                except OSError:
+                    self.pad = None
+            self.set_status()
+
+    def drop_pad(self):
+        was = self.active
+        try:
+            self.pad.close()
+        except OSError:
+            pass
+        self.pad = None
+        if was:
+            self.out.release_all()
+        self.set_status()
+
+    # -- actions --
+    def call(self, what):
+        if what == "osk":
+            # pad-osk@local GNOME extension opens the keyboard directly (GNOME otherwise only
+            # shows it after touchscreen input). Fallback: just flip the a11y setting.
+            r = subprocess.run(["busctl", "--user", "call", "org.gnome.Shell", "/org/local/PadOsk",
+                                "org.local.PadOsk", "Toggle"], capture_output=True, text=True)
+            if r.returncode != 0:
+                notify("Keyboard helper not loaded yet: log out and back in once")
+                sh("gsettings", "set", "org.gnome.desktop.a11y.applications",
+                   "screen-keyboard-enabled", "true")
+        elif what == "precision":
+            self.precision = not self.precision
+            notify("Precision pointer " + ("on" if self.precision else "off"))
+            self.set_status()
+        elif what == "audio":
+            r = subprocess.run([str(Path.home() / ".local/bin/audio")],
+                               capture_output=True, text=True, timeout=20)
+            notify((r.stdout.strip() or "audio toggled").splitlines()[-1], "Audio")
+
+    def press(self, name, now):
+        self.pressed[name] = now
+        if name == "GUIDE":
+            self.guide_fired = False
+            return
+        if not self.active:
+            return
+        if name == "VIEW":
+            self.fn, self.fn_used = True, False
+            return
+        if self.fn:
+            self.fn_used = True
+        if self.switching and name == "A":       # pick the highlighted window
+            self.out.key(K["SHIFT"], False)
+            self.out.key(K["ALT"], False)
+            self.switching = 0.0
+            self.held[name] = ("none",)
+            return
+        action = (FN if self.fn else BASE).get(name, ("none",))
+        self.held[name] = action
+        kind = action[0]
+        if kind == "hold":
+            self.out.key(action[1], True)
+        elif kind == "tap":
+            self.out.tap(action[1], action[2])
+        elif kind == "call":
+            self.call(action[1])
+        elif kind == "switch":
+            self.out.key(K["ALT"], True)
+            self.out.key(K["SHIFT"], action[1] < 0)
+            self.out.tap([], K["TAB"])
+            self.switching = now + SWITCH_LINGER
+
+    def release(self, name, now):
+        t0 = self.pressed.pop(name, now)
+        if name == "GUIDE":
+            if not self.guide_fired and self.active and now - t0 < 0.6:
+                self.out.tap([], K["META"])
+            return
+        if name == "VIEW":
+            if self.fn and not self.fn_used and now - t0 < 0.5:
+                notify(NOTIFY_HELP, "Controller buttons")
+            self.fn = False
+            return
+        action = self.held.pop(name, ("none",))
+        if action[0] == "hold":
+            self.out.key(action[1], False)
+        elif action[0] == "switch":
+            self.switching = now + SWITCH_LINGER
+
+    def handle(self, etype, code, value, now):
+        p = self.pad
+        if etype == EV_KEY and code in BUTTONS:
+            name = BUTTONS[code]
+            if value == 1:
+                self.press(name, now)
+            elif value == 0:
+                self.release(name, now)
+        elif etype == EV_ABS:
+            if code == ABS_HAT0X or code == ABS_HAT0Y:
+                neg, pos = ("DL", "DR") if code == ABS_HAT0X else ("DU", "DD")
+                for name, want in ((neg, value < 0), (pos, value > 0)):
+                    if want and name not in self.pressed:
+                        self.press(name, now)
+                    elif not want and name in self.pressed:
+                        self.release(name, now)
+            elif code in (p.lt, p.rt):
+                name = "LT" if code == p.lt else "RT"
+                v = p.norm(code, value)
+                if v > 0.6 and name not in self.pressed:
+                    self.press(name, now)
+                elif v < 0.4 and name in self.pressed:
+                    self.release(name, now)
+            else:
+                self.axes[code] = p.norm(code, value)
+
+    def curve(self, v):
+        a = abs(v)
+        if a < DEADZONE:
+            return 0.0
+        a = ((a - DEADZONE) / (1 - DEADZONE)) ** CURVE
+        return a if v > 0 else -a
+
+    def tick(self, now, dt):
+        if "GUIDE" in self.pressed and not self.guide_fired \
+                and now - self.pressed["GUIDE"] >= GUIDE_HOLD:
+            self.guide_fired = True
+            self.toggle(not self.enabled)
+        if not self.active:
+            return
+        if self.switching and now > self.switching and "LB" not in self.held \
+                and "RB" not in self.held:
+            self.out.key(K["SHIFT"], False)
+            self.out.key(K["ALT"], False)
+            self.switching = 0.0
+        p = self.pad
+        speed = POINTER_MAX * (PRECISION if self.precision else 1.0) * dt
+        mx = self.curve(self.axes.get(ABS_X, 0.0)) * speed
+        my = self.curve(self.axes.get(ABS_Y, 0.0)) * speed
+        sx = self.curve(self.axes.get(p.rx, 0.0)) * SCROLL_MAX * dt
+        sy = -self.curve(self.axes.get(p.ry, 0.0)) * SCROLL_MAX * dt
+        moved = False
+        for i, (code, v) in enumerate(((REL_X, mx), (REL_Y, my),
+                                        (REL_HWHEEL_HI, sx), (REL_WHEEL_HI, sy))):
+            if v == 0.0:
+                self.acc[i] = 0.0
+                continue
+            self.acc[i] += v
+            whole = int(self.acc[i])
+            if whole:
+                self.acc[i] -= whole
+                self.out.emit(EV_REL, code, whole)
+                moved = True
+                if i >= 2:                         # matching legacy notch every 120 units
+                    j = i - 2
+                    self.legacy[j] += whole
+                    notches = int(self.legacy[j] / 120)
+                    if notches:
+                        self.legacy[j] -= notches * 120
+                        self.out.emit(EV_REL, REL_HWHEEL if j == 0 else REL_WHEEL, notches)
+        if moved:
+            self.out.sync()
+
+    def run(self):
+        self.state_mtime = STATE.stat().st_mtime if STATE.exists() else 0.0
+        last = time.monotonic()
+        next_pad_check = 0.0
+        while True:
+            now = time.monotonic()
+            if now >= next_pad_check:
+                self.check_pad()
+                self.check_state_file()
+                next_pad_check = now + 1.0
+            self.check_game(now)
+            if self.pad is None:
+                time.sleep(1.0)
+                last = time.monotonic()
+                continue
+            r, _, _ = select.select([self.pad.fd], [], [], TICK)
+            now = time.monotonic()
+            if r:
+                try:
+                    data = os.read(self.pad.fd, EVENT.size * 64)
+                except OSError:                    # controller disconnected
+                    self.drop_pad()
+                    continue
+                for off in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                    _, _, etype, code, value = EVENT.unpack_from(data, off)
+                    self.handle(etype, code, value, now)
+            self.tick(now, min(now - last, 0.05))
+            last = now
+
+
+# ---- CLI ----------------------------------------------------------------------------
+def status_text():
+    try:
+        lines = STATUS.read_text().splitlines()
+    except OSError:
+        lines = []
+    svc = subprocess.run(["systemctl", "--user", "is-active", "padmode"],
+                         capture_output=True, text=True).stdout.strip()
+    if svc != "active":
+        return f"🎮 service not running ({svc}) — systemctl --user start padmode"
+    mode = lines[0] if lines else "starting"
+    dev = f" · {lines[1]}" if len(lines) > 1 and lines[1] else ""
+    return f"🎮 desktop mode: {mode}{dev}"
+
+
+def test():
+    path, name = find_controller()
+    if not path:
+        sys.exit("No Xbox controller found.")
+    print(f"{name} at {path} — press buttons (20s, Ctrl+C to stop)")
+    fd = os.open(path, os.O_RDONLY)
+    end = time.monotonic() + 20
+    while time.monotonic() < end:
+        r, _, _ = select.select([fd], [], [], 0.5)
+        if r:
+            data = os.read(fd, EVENT.size * 64)
+            for off in range(0, len(data), EVENT.size):
+                _, _, t, c, v = EVENT.unpack_from(data, off)
+                if t == EV_KEY and v == 1:
+                    print(f"  button 0x{c:x} -> {BUTTONS.get(c, '?')}")
+                elif t == EV_ABS and c in (ABS_HAT0X, ABS_HAT0Y) and v:
+                    print(f"  d-pad {'X' if c == ABS_HAT0X else 'Y'} {v}")
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else "toggle"
+    if arg == "daemon":
+        Daemon().run()
+    elif arg in ("on", "off", "toggle"):
+        on = (not read_state()) if arg == "toggle" else arg == "on"
+        write_state(on)            # the daemon notices within a second
+        time.sleep(1.2)
+        print(status_text())
+    elif arg == "status":
+        print(status_text())
+    elif arg == "auto":
+        want = sys.argv[2] if len(sys.argv) > 2 else ""
+        if want in ("on", "off"):
+            CONF.mkdir(parents=True, exist_ok=True)
+            AUTO_ON.write_text(want + "\n")
+        print(f"auto-on when a controller connects: {'on' if auto_on() else 'off'}")
+    elif arg in ("keys", "help", "map"):
+        print(KEYS_HELP)
+    elif arg == "test":
+        test()
+    else:
+        print(__doc__.strip())
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

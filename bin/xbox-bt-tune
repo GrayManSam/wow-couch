@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Xbox Wireless Controller (Bluetooth LE) tuning for Fedora + Proton.
+# Run once with: sudo ~/.local/bin/xbox-bt-tune
+set -euo pipefail
+[[ $EUID -eq 0 ]] || { echo "Run with sudo"; exit 1; }
+
+# 1) Let Proton/SDL open the controller's hidraw node directly (SDL HIDAPI driver):
+#    exact Xbox button layout, Guide button, rumble, battery. steam-devices doesn't cover Microsoft pads.
+cat > /etc/udev/rules.d/71-xbox-controller-hidraw.rules <<'EOF'
+# Microsoft Xbox controllers: user access to hidraw for SDL/Proton (Bluetooth + USB)
+KERNEL=="hidraw*", KERNELS=="0005:045E:*", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="045e", MODE="0660", TAG+="uaccess"
+EOF
+udevadm control --reload-rules
+udevadm trigger --subsystem-match=hidraw
+
+# 2) Low-latency BLE link: default interval is 30-50 ms; request 7.5-11.25 ms (units of 1.25 ms).
+CONF=/etc/bluetooth/main.conf
+cp -n "$CONF" "$CONF.bak-before-xbox"
+sed -i \
+  -e 's/^#MinConnectionInterval=$/MinConnectionInterval=6/' \
+  -e 's/^#MaxConnectionInterval=$/MaxConnectionInterval=9/' \
+  -e 's/^#ConnectionLatency=$/ConnectionLatency=0/' \
+  "$CONF"
+grep -nE '^(Min|Max)ConnectionInterval|^ConnectionLatency' "$CONF"
+
+# 3) Restart BlueZ to apply (controller + any BT audio drop; press the Xbox button to reconnect).
+systemctl restart bluetooth
+echo "Done. Press the Xbox button to reconnect the controller."
