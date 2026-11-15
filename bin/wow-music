@@ -1,0 +1,569 @@
+#!/usr/bin/python3 -I
+"""wow-music - Spotify in the background for WoW sessions, driven from the controller.
+
+  wow-music start [--force] [--dry-run]
+                        open Spotify (minimized) and play the playlist, shuffled. If music is
+                        already playing it is left alone unless --force. Run by `battlenet --wow`.
+  wow-music stop        end of the WoW session: pause what `start` started, quit Spotify if
+                        `start` launched it. Music you were already playing keeps playing.
+  wow-music toggle | play | pause | next | prev
+  wow-music vol up | down | N      Spotify's own volume (not the game's), N = 0-100
+  wow-music status      track, state, volume, where it is playing
+  wow-music playlist [URL|URI]     show / set what `start` plays (playlist, album, artist)
+  wow-music pair        one-time: connect the headless player to your Spotify account
+  wow-music update      download the current Soloist build (they expire after 90 days)
+  wow-music on | off    start with WoW or not (default on). While on, `battlenet --wow` also
+                        switches the game's own music off (Sound_EnableMusic 0); off = back on.
+
+Controller (pad, also while WoW runs): Share tap = play/pause in games, hold Share and flick
+the right stick: right/left = next/previous track, up/down = volume.
+Player: Spotify Soloist, Spotify's official headless player (~/.local/bin/soloist, user service
+soloist.service = Connect device "WoW Couch", started for the session and stopped after it,
+driven with `soloist ctl`). API key: ~/.config/wow-music/soloist.env (0600). One-time pairing:
+`wow-music pair`. Soloist builds expire after 90 days: `wow-music update` (automatic once a
+build is 60 days old). Not paired / broken / "player": "app" in the config -> the Spotify
+desktop app is launched minimized instead (MPRIS over busctl, volume via its PipeWire stream).
+A desktop app that is already playing is left alone. Stdlib only.
+Config: ~/.config/wow-music/config.json
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CONF = Path(os.environ.get("WOW_MUSIC_CONF") or Path.home() / ".config/wow-music")
+CONFIG = CONF / "config.json"
+SESSION = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "wow-music.session"
+DEFAULTS = {
+    "playlist": "",       # set with: wow-music playlist <spotify link>
+    "shuffle": True,
+    "enabled": True,
+    "step": 5,            # volume step in percent
+    "volume": None,       # percent applied to Spotify's stream at start (None = leave)
+    "player": "auto",     # auto = Soloist (headless) when paired, else the desktop app; "app"
+}
+BUS = "org.mpris.MediaPlayer2.spotify"
+SOLOIST = Path.home() / ".local/bin/soloist"
+SOLOIST_ENV = CONF / "soloist.env"
+SOLOIST_URL = "https://soloist-builds.spotifycdn.com/soloist_release_x86_64.tar.gz"
+SOLOIST_MAX_AGE = 60      # days: refresh the build well before the 90-day expiry
+UNIT = "soloist.service"
+DEVICE = "WoW Couch"
+OBJ = "/org/mpris/MediaPlayer2"
+PLAYER = "org.mpris.MediaPlayer2.Player"
+QUIET = os.environ.get("WOW_MUSIC_QUIET") == "1"
+
+
+def run(*cmd, timeout=8):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, ""
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def notify(body):
+    if QUIET:
+        return
+    try:
+        subprocess.Popen(["notify-send", "-a", "wow-music", "-i", "audio-x-generic", "-e", "-h",
+                          "string:x-canonical-private-synchronous:wow-music", "Music", body],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def config():
+    cfg = dict(DEFAULTS)
+    try:
+        cfg.update(json.loads(CONFIG.read_text()))
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def save(cfg):
+    CONF.mkdir(parents=True, exist_ok=True)
+    CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+def to_uri(text):
+    """open.spotify.com link or spotify: URI -> spotify:type:id"""
+    text = text.strip()
+    m = re.match(r"spotify:(playlist|album|artist|track|show|episode):([A-Za-z0-9]+)$", text)
+    if not m:
+        m = re.search(r"open\.spotify\.com/(?:embed/)?(?:intl-[a-z-]+/)?"
+                      r"(playlist|album|artist|track|show|episode)/([A-Za-z0-9]+)", text)
+    return f"spotify:{m.group(1)}:{m.group(2)}" if m else None
+
+
+# ---- Spotify over MPRIS -------------------------------------------------------------
+def call(method, *args):
+    return run("busctl", "--user", "call", BUS, OBJ, PLAYER, method, *args)[0] == 0
+
+
+def prop(name):
+    rc, out = run("busctl", "--user", "--json=short", "get-property", BUS, OBJ, PLAYER, name)
+    if rc:
+        return None
+    try:
+        return json.loads(out)["data"]
+    except (ValueError, KeyError):
+        return None
+
+
+def running():
+    return prop("PlaybackStatus") is not None
+
+
+def track():
+    md = prop("Metadata") or {}
+    def val(key):
+        v = md.get(key, {})
+        return v.get("data") if isinstance(v, dict) else None
+    title, artist = val("xesam:title"), val("xesam:artist")
+    if not title:
+        return ""
+    return f"{', '.join(artist) if artist else '?'} - {title}"
+
+
+def minimize():
+    """Spotify to the background: minimize every shown window (XWayland)."""
+    n = 0
+    for w in run("xdotool", "search", "--class", "^spotify$")[1].split():
+        if "window state: Normal" in run("xprop", "-id", w, "WM_STATE")[1]:
+            n += run("xdotool", "windowminimize", w)[0] == 0
+    return n
+
+
+# ---- volume: Spotify's own PipeWire stream ------------------------------------------
+def streams():
+    rc, out = run("pactl", "-f", "json", "list", "sink-inputs")
+    try:
+        items = json.loads(out) if not rc else []
+    except ValueError:
+        items = []
+    found = []
+    for it in items:
+        p = it.get("properties", {})
+        names = (p.get("application.name", ""), p.get("application.process.binary", ""))
+        if any("spotify" in n.lower() for n in names):
+            vols = [int(v["value_percent"].rstrip("%")) for v in it.get("volume", {}).values()]
+            found.append((str(it["index"]), max(vols) if vols else 100))
+    return found
+
+
+def set_volume(pct):
+    pct = max(0, min(100, int(pct)))
+    ss = streams()
+    for idx, _ in ss:
+        run("pactl", "set-sink-input-volume", idx, f"{pct}%")
+        run("pactl", "set-sink-input-mute", idx, "0")
+    return pct if ss else None
+
+
+def volume(arg, cfg):
+    if soloist_on():
+        cur = find(soloist_now(), "volume", "volume_percent")
+        cur = int(cur) if isinstance(cur, (int, float)) else (cfg["volume"] or 70)
+        if arg in ("up", "down"):
+            new = cur + (cfg["step"] if arg == "up" else -cfg["step"])
+        elif arg.isdigit():
+            new = int(arg)
+        else:
+            log(f"volume {cur}%"); return 0
+        new = max(0, min(100, new))
+        ctl("volume", str(new))
+        cfg["volume"] = new
+        save(cfg)
+        log(f"volume {new}%"); notify(f"Volume {new}%")
+        return 0
+    ss = streams()
+    if not ss:
+        state = prop("PlaybackStatus")
+        msg = ("Spotify is playing on another device: volume is set there"
+               if state == "Playing" else "Spotify has no sound stream yet (start playback first)")
+        log(msg); notify(msg)
+        return 1
+    cur = ss[0][1]
+    if arg == "up":
+        new = cur + cfg["step"]
+    elif arg == "down":
+        new = cur - cfg["step"]
+    elif arg.isdigit():
+        new = int(arg)
+    else:
+        log(f"volume {cur}%")
+        return 0
+    new = set_volume(new)
+    cfg["volume"] = new
+    save(cfg)
+    log(f"volume {new}%"); notify(f"Volume {new}%")
+    return 0
+
+
+# ---- Soloist (headless) -------------------------------------------------------------
+def unit_active():
+    return run("systemctl", "--user", "is-active", "--quiet", UNIT)[0] == 0
+
+
+def ctl(*args, timeout=8):
+    return run(str(SOLOIST), "ctl", *args, timeout=timeout)
+
+
+def soloist_paired():
+    """Running and logged in to a Spotify account."""
+    return unit_active() and "logged in: yes" in ctl("status")[1]
+
+
+def soloist_on():
+    """The controls go to Soloist while its service runs and it is paired."""
+    return SOLOIST.exists() and soloist_paired()
+
+
+def find(obj, *keys):
+    """First value of any of these keys anywhere in a JSON structure."""
+    if isinstance(obj, dict):
+        for k in keys:
+            if k in obj and not isinstance(obj[k], (dict, list)):
+                return obj[k]
+        obj = list(obj.values())
+    if isinstance(obj, list):
+        for v in obj:
+            r = find(v, *keys)
+            if r is not None:
+                return r
+    return None
+
+
+def soloist_now():
+    rc, out = ctl("now", "--json")
+    try:
+        return json.loads(out) if not rc else {}
+    except ValueError:
+        return {}
+
+
+def soloist_playing(now=None):
+    now = soloist_now() if now is None else now
+    return now.get("status") == "playing"
+
+
+def soloist_track(now=None):
+    """`ctl now --json`: item.decorations.identity.name, item.decorations.creators[].entity...name"""
+    now = soloist_now() if now is None else now
+    try:
+        item = now["item"]
+        title = item["decorations"]["identity"]["name"]
+        artists = [c["entity"]["decorations"]["identity"]["name"]
+                   for c in item["decorations"].get("creators", [])]
+    except (KeyError, TypeError):
+        return ""
+    return f"{', '.join(artists[:2]) or '?'} - {title}"
+
+
+def soloist_age():
+    """Days since this build was made (from `soloist --version`: ... (20261113) ...)."""
+    m = re.search(r"\((\d{4})(\d\d)(\d\d)\)", run(str(SOLOIST), "--version")[1])
+    if not m:
+        return None
+    import datetime
+    built = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    return (datetime.date.today() - built).days
+
+
+def update():
+    """Fetch the current build from Spotify's CDN and swap it in."""
+    import tarfile, tempfile, urllib.request
+    was = unit_active()
+    with tempfile.TemporaryDirectory() as d:
+        arc = Path(d) / "soloist.tar.gz"
+        try:
+            with urllib.request.urlopen(SOLOIST_URL, timeout=60) as r:
+                arc.write_bytes(r.read())
+            with tarfile.open(arc) as t:
+                t.extract("soloist", d, filter="data")
+        except Exception as e:                       # network, archive: keep the old build
+            log(f"update failed: {e}")
+            return 1
+        new = Path(d) / "soloist"
+        new.chmod(0o755)
+        rc, ver = run(str(new), "--version")
+        if rc:
+            log("update failed: the new build does not run")
+            return 1
+        if was:
+            run("systemctl", "--user", "stop", UNIT, timeout=20)
+        tmp = SOLOIST.with_suffix(".new")
+        tmp.write_bytes(new.read_bytes())
+        tmp.chmod(0o755)
+        tmp.replace(SOLOIST)
+        if was:
+            run("systemctl", "--user", "start", UNIT, timeout=20)
+    log(f"updated: {ver}")
+    return 0
+
+
+def soloist_start(cfg, uri, session):
+    if not (SOLOIST.exists() and SOLOIST_ENV.exists()):
+        return False
+    age = soloist_age()
+    if age is not None and age >= SOLOIST_MAX_AGE:
+        log(f"Soloist build is {age} days old: updating")
+        update()
+    session.update(player="soloist", launched=not unit_active())
+    SESSION.write_text(json.dumps(session))
+    if session["launched"]:
+        log("starting Soloist")
+        run("systemctl", "--user", "start", UNIT, timeout=20)
+    deadline = time.monotonic() + 20
+    while not soloist_paired():
+        if not unit_active() and time.monotonic() > deadline - 15:
+            log("soloist.service is not running (expired build? wow-music update)")
+            return False
+        if time.monotonic() > deadline:
+            log("Soloist is not paired with a Spotify account (wow-music pair)")
+            return False
+        time.sleep(0.5)
+    ctl("activate")
+    ctl("volume", str(cfg["volume"] if cfg["volume"] is not None else 70))
+    ctl("shuffle", "on" if cfg["shuffle"] else "off")
+    deadline = time.monotonic() + 30
+    while True:
+        ctl("play", uri)
+        time.sleep(2.0)
+        if soloist_playing():
+            break
+        if time.monotonic() > deadline:
+            log("Soloist did not start playing in 30s")
+            return False
+    if cfg["shuffle"]:
+        ctl("next")                               # so the session does not always open on track 1
+        time.sleep(0.8)
+    session["started"] = True
+    SESSION.write_text(json.dumps(session))
+    log(f"playing {uri} (headless): {soloist_track()}")
+    return True
+
+
+def pair():
+    if not SOLOIST.exists():
+        log(f"{SOLOIST} is not installed"); return 1
+    if not SOLOIST_ENV.exists():
+        log(f"no API key: put SOLOIST_API_KEY=... in {SOLOIST_ENV} (chmod 600), "
+            "key from https://developer.spotify.com/dashboard/soloist"); return 1
+    run("systemctl", "--user", "start", UNIT, timeout=20)
+    if soloist_paired():
+        log("already paired"); return 0
+    log(f'Open Spotify (this laptop or your phone on the same Wi-Fi), tap the "Connect to a '
+        f'device" icon and pick "{DEVICE}". Waiting up to 5 minutes...')
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        if soloist_paired():
+            ctl("pause")
+            log("paired: WoW sessions now use the headless player"); return 0
+        time.sleep(2)
+    log("not paired yet (run wow-music pair again)")
+    return 1
+
+
+# ---- session ------------------------------------------------------------------------
+def start(cfg, force=False, dry=False):
+    if not cfg["enabled"] and not force:
+        log("off (wow-music on to enable)")
+        return 0
+    uri = to_uri(cfg["playlist"])
+    if not uri:
+        log("no playlist yet: wow-music playlist <spotify link (playlist, album or artist)>")
+        return 1
+    was_running = running()
+    state = prop("PlaybackStatus") if was_running else None
+    headless = cfg["player"] != "app" and SOLOIST.exists() and SOLOIST_ENV.exists()
+    if dry and headless and not (state == "Playing" and not force):
+        log(f"would: start Soloist (headless) and play {uri}; desktop app only as fallback")
+        return 0
+    if headless and not dry and not (state == "Playing" and not force):
+        if state == "Playing":
+            call("Pause")
+        session = {"player": "soloist", "launched": False, "started": False}
+        if soloist_start(cfg, uri, session):
+            return 0
+        if session.get("launched"):
+            run("systemctl", "--user", "stop", UNIT, timeout=20)
+        log("falling back to the Spotify desktop app")
+        notify("Headless player not ready: using the Spotify app")
+        was_running = running()
+        state = prop("PlaybackStatus") if was_running else None
+    if dry:
+        log(f"would: {'use running Spotify' if was_running else 'launch Spotify'} "
+            f"(state={state}), minimize it, "
+            f"{'leave current music playing' if state == 'Playing' and not force else 'play ' + uri}")
+        return 0
+    session = {"player": "app", "launched": not was_running, "started": False}
+    if not was_running:
+        log("launching Spotify")
+        subprocess.Popen(["spotify"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        SESSION.write_text(json.dumps(session))
+        deadline = time.monotonic() + 45
+        while not running():
+            if time.monotonic() > deadline:
+                log("Spotify did not come up in 45s")
+                return 1
+            time.sleep(0.5)
+        for _ in range(20):                       # its window shows a moment after D-Bus
+            if minimize():
+                break
+            time.sleep(0.5)
+        time.sleep(2.0)                           # login/session restore before it takes a URI
+    else:
+        minimize()
+    if state == "Playing" and not force:
+        log(f"already playing, left alone: {track()}")
+    else:
+        deadline = time.monotonic() + 30
+        while True:
+            call("OpenUri", "s", uri)
+            time.sleep(2.0)
+            if prop("PlaybackStatus") == "Playing":
+                break
+            call("Play")
+            if time.monotonic() > deadline:
+                log("Spotify did not start playing in 30s")
+                SESSION.write_text(json.dumps(session))
+                return 1
+        session["started"] = True
+        if cfg["shuffle"] and prop("Shuffle") is False:
+            run("busctl", "--user", "set-property", BUS, OBJ, PLAYER, "Shuffle", "b", "true")
+            call("Next")                          # so the session does not always open on track 1
+        log(f"playing {uri}: {track()}")
+    SESSION.write_text(json.dumps(session))
+    minimize()
+    # Sound must come out of this computer: a stream shows up within a few seconds.
+    for _ in range(16):
+        if streams():
+            if cfg["volume"] is not None:
+                set_volume(cfg["volume"])
+            return 0
+        time.sleep(0.5)
+    msg = "Spotify is playing on another device (Spotify > Connect to a device > This computer)"
+    log(msg); notify(msg)
+    return 0
+
+
+def stop():
+    try:
+        session = json.loads(SESSION.read_text())
+    except (OSError, ValueError):
+        log("no session: nothing to stop")
+        return 0
+    SESSION.unlink(missing_ok=True)
+    if session.get("player") == "soloist":
+        if session.get("launched"):
+            run("systemctl", "--user", "stop", UNIT, timeout=20)
+            log("Soloist stopped")
+        elif session.get("started"):
+            ctl("pause")
+            log("paused")
+    elif session.get("launched"):
+        run("busctl", "--user", "call", BUS, OBJ, "org.mpris.MediaPlayer2", "Quit")
+        log("Spotify closed")
+    elif session.get("started"):
+        call("Pause")
+        log("paused")
+    else:
+        log("music was playing before WoW: left alone")
+    return 0
+
+
+def status(cfg):
+    if soloist_on():
+        now = soloist_now()
+        log(f"{'Playing' if soloist_playing(now) else 'Paused'}: {soloist_track(now) or '-'}  "
+            f"[headless Soloist, volume {find(now, 'volume', 'volume_percent')}%]")
+    elif not running():
+        log("Spotify is not running")
+    else:
+        ss = streams()
+        where = f"this computer, volume {ss[0][1]}%" if ss else \
+            ("another device" if prop("PlaybackStatus") == "Playing" else "no stream")
+        log(f"{prop('PlaybackStatus')}: {track() or '-'}  [{where}]")
+    if cfg["player"] != "app" and SOLOIST.exists():
+        age = soloist_age()
+        log(f"headless player: installed, build {age} days old (expires at 90)"
+            + ("" if SOLOIST_ENV.exists() else "  - NO API KEY")
+            + ("" if not unit_active() or soloist_paired() else "  - NOT PAIRED (wow-music pair)"))
+    log(f"with WoW: {'on' if cfg['enabled'] else 'off'}   playlist: {cfg['playlist']}   "
+        f"shuffle: {'on' if cfg['shuffle'] else 'off'}")
+    return 0
+
+
+def control(cmd):
+    if soloist_on():
+        if cmd == "toggle":
+            cmd = "pause" if soloist_playing() else "play"
+        ctl(cmd)
+        time.sleep(0.5)
+        now = soloist_now()
+        log(f"{'Playing' if soloist_playing(now) else 'Paused'}: {soloist_track(now)}")
+        return 0
+    if not running():
+        log("Spotify is not running (wow-music start)"); notify("Spotify is not running")
+        return 1
+    method = {"toggle": "PlayPause", "play": "Play", "pause": "Pause",
+              "next": "Next", "prev": "Previous"}[cmd]
+    call(method)
+    time.sleep(0.4)
+    log(f"{prop('PlaybackStatus')}: {track()}")
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    cmd = args[0] if args else "status"
+    cfg = config()
+    if cmd == "start":
+        return start(cfg, "--force" in args, "--dry-run" in args)
+    if cmd == "stop":
+        if "--dry-run" in args:
+            log("would end the music session"); return 0
+        return stop()
+    if cmd in ("toggle", "play", "pause", "next", "prev"):
+        return control(cmd)
+    if cmd in ("vol", "volume"):
+        return volume(args[1] if len(args) > 1 else "", cfg)
+    if cmd == "status":
+        return status(cfg)
+    if cmd == "playlist":
+        if len(args) > 1:
+            uri = to_uri(args[1])
+            if not uri:
+                log("not a Spotify link or URI"); return 1
+            cfg["playlist"] = uri
+            save(cfg)
+        log(cfg["playlist"])
+        return 0
+    if cmd == "pair":
+        return pair()
+    if cmd == "update":
+        return update()
+    if cmd == "enabled":                          # exit status only (used by battlenet)
+        return 0 if cfg["enabled"] else 1
+    if cmd in ("on", "off"):
+        cfg["enabled"] = cmd == "on"
+        save(cfg)
+        log(f"music with WoW: {cmd}")
+        return 0
+    print(__doc__)
+    return 0 if cmd in ("help", "-h", "--help") else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

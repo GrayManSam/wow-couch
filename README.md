@@ -15,13 +15,14 @@ GE-Proton (umu-launcher) and an Xbox controller over Bluetooth.
 | `couch wow-display start\|stop` | Screens: with the TV plugged in, the TV is the only screen (4K, 200% scale, 60 Hz by default: the 3rd-gen Framework HDMI card is HDMI 2.0b and goes black at 4K120; after a 4th-gen card / HDMI 2.1 adapter put `120` in `~/.config/gameprofile/tv-max-hz`, laptop panel off) while the lid is closed, while a WoW session runs (`wow-display start`, the launcher calls it; the previous layout is saved and `stop` restores it), or after `couch on`. Lid open again -> laptop + TV come back. `--dry-run` checks layouts with `gdctl set --verify`. The service never changes the layout while WoW/Battle.net runs (Wine crashes on a monitor reconfigure). |
 | `bin/battlenet` | Battle.net / WoW launcher for GE-Proton + umu, with a watchdog that cleans up the invisible "closed to tray" Battle.net session, and ends a Wow.exe left hung after the in-game **Exit Game** (client destroyed, window gone). Runs `couch wow-prep` before every launch. |
 | `profiles/wow-*.cvars` | WoW graphics/gamepad CVars applied per profile before launch (render scale, vsync, FPS cap, GamePadEnable, soft targeting). |
-| `addons/CouchUI` | In game: switches Edit Mode layout ("Couch"/"Desk"), chat font and UI scale by profile; `/couch arrange` moves minimap/chat/damage meter/quests out of the way; sets sensible desk keybinds once (`/couch binds undo` restores). Couch: a **Social** mini wheel on LT + RB — invite, inspect, guild invite, trade, follow, add friend, leave group, all on your current target (pick it with LB / assist; nothing is auto-targeted); your target is offered first for `/w` on Easy Controller's keyboard. `/couch social [off\|rebind]`. |
+| `addons/CouchUI` | In game: switches Edit Mode layout ("Couch"/"Desk"), chat font and UI scale by profile; `/couch arrange` moves minimap/chat/damage meter/quests out of the way; sets sensible desk keybinds once (`/couch binds undo` restores). Couch: a **Social** mini wheel on LT + RB — invite, inspect, guild invite, trade, follow, add friend, leave group, all on your current target (pick it with LB / assist; nothing is auto-targeted); your target is offered first for `/w` on Easy Controller's keyboard. `/couch social [off\|rebind]`. **`/couch help`** (or *Controls* on the Social wheel) shows the controller map: every button in every layer read live from Easy Controller, the wheels, what each macro does, and the music / voice shortcuts; macro buttons say what they do in their tooltip. |
 | `addons/CouchWheels` | Fills Easy Controller's radial wheels with every spell, ability and profession you know, and keeps them up to date as you learn new ones. |
 | `bin/xbox-bt-tune` | One-time root script: udev rule so SDL/Proton can use the controller's hidraw node (correct layout, Guide button, rumble), and a low-latency Bluetooth LE connection interval. |
 | `bin/audio` | Sound for WoW sessions: `audio wow start\|stop\|route` puts the game on the TV (unmuted, volume set — new HDMI routes start at 40%/-24 dB otherwise), optional EasyEffects presets; `audio wow doctor` prints the whole chain and plays 3 test beeps through the TV. |
 | `bin/xbox-headset` + `xbox-headset.service` | Headset in the controller's 3.5 mm jack -> sound on **TV + headset** at once (like an Xbox), headset mic becomes the default input. Switches automatically by connection: Bluetooth = TV only (the jack never carries audio over Bluetooth), USB-C or Xbox Wireless Adapter = TV + headset (needs the `xone` driver). `audio headset status\|test\|chat-only on\|off\|mute\|mirror tv\|never`. |
 | `headset/install-xone.sh` | One-time root script: installs [xone](https://github.com/dlundqvist/xone) v0.5.8 with DKMS (Secure Boot: uses the enrolled DKMS key) + the Wireless Adapter firmware. xpad is only loaded when xone isn't built for the running kernel, so a kernel update xone can't build for never leaves a USB controller without a driver. `--uninstall` undoes it. |
 | `bin/discord-voice` | Join / leave / mute / deafen a Discord voice channel from the controller, via Discord's local RPC as **your own** Discord application (no user token, no self-bot). `discord-voice setup` once. |
+| `bin/wow-music` + `soloist.service` | Spotify in the background for WoW sessions. `battlenet --wow` starts your playlist (shuffled) and switches the game's own music off; when WoW exits the music stops. Uses **Spotify Soloist**, Spotify's official headless player (about 55 MB instead of ~1 GB for the desktop app), and falls back to the desktop app (minimized) when Soloist isn't set up. From the controller, in game too: hold **Share** + right stick right/left = next/previous track, up/down = music volume, tap Share = play/pause. `wow-music playlist <link>`, `wow-music toggle\|next\|prev\|vol up\|down\|N`, `wow-music off`. |
 | `bin/discord-overlay` + `autostart/` | Starts [Discover Overlay](https://github.com/trigg/Discover) (Flatpak `io.github.trigg.discover_overlay`) — who's in voice / speaking, over the game; Discord's own overlay doesn't run on Linux. |
 
 Per profile, `couch wow-prep` toggles addons in every character's `AddOns.txt`:
@@ -54,6 +55,24 @@ sudo ~/.local/bin/xbox-bt-tune                                  # optional, once
 ```
 
 Log out and back in once so GNOME loads the on-screen-keyboard extension.
+
+### Music (optional)
+
+```sh
+wow-music playlist https://open.spotify.com/playlist/...   # what plays with WoW
+```
+
+That alone works with the Spotify desktop app. For the headless player (Spotify Premium):
+
+1. Download [Spotify Soloist](https://developer.spotify.com/documentation/soloist) and put the
+   `soloist` binary in `~/.local/bin/` (builds expire after 90 days; `wow-music update` fetches
+   the current one, and does so by itself once a build is 60 days old).
+2. Create your own API key at <https://developer.spotify.com/dashboard/soloist> and save it:
+   `echo "SOLOIST_API_KEY=..." > ~/.config/wow-music/soloist.env && chmod 600 ~/.config/wow-music/soloist.env`
+3. `wow-music pair`, then pick **WoW Couch** in the device list of any Spotify app on the same
+   network. Once.
+
+Open-source players (spotifyd, librespot...) no longer work: Spotify refuses them audio keys.
 
 ## Use
 

@@ -10,8 +10,11 @@
   pad auto on|off  turn desktop mode on whenever a controller connects (default on)
 
 From the controller itself: hold the Xbox button for 1 second to toggle.
-Discord voice (works in games too, the Share button is unbound in WoW): hold Share 0.6s =
-join/leave General voice, double-tap Share = mute, triple-tap = deafen (discord-voice).
+Discord voice (works in games too, the Share button is unbound in WoW): hold Share 0.6s and
+let go = join/leave General voice, double-tap Share = mute, triple-tap = deafen (discord-voice).
+Music (wow-music, Spotify; works in games too): hold Share and flick the right stick: right /
+left = next / previous track, up / down = volume (keeps going while held). While a game runs a
+single Share tap = play/pause.
 Desktop mode pauses itself while a game runs (patterns in ~/.config/padmode/games),
 so WoW / Steam games get the controller to themselves.
 Stdlib only: reads /dev/input/eventN, writes a virtual mouse+keyboard via /dev/uinput.
@@ -37,6 +40,10 @@ DEFAULT_GAMES = ["Wow.exe", "SteamLaunch", "gamescope"]
 VOICE = Path(os.environ.get("PADMODE_VOICE") or Path.home() / ".local/bin/discord-voice")
 SHARE_HOLD = 0.6         # hold Share this long: join/leave Discord voice
 SHARE_TAPS = 0.35        # gap that ends a Share tap sequence (1 screenshot, 2 mute, 3 deafen)
+MUSIC = Path(os.environ.get("PADMODE_MUSIC") or Path.home() / ".local/bin/wow-music")
+MUSIC_FLICK = 0.7        # right-stick deflection (with Share held) that counts as a flick
+MUSIC_REARM = 0.4        # stick must come back inside this before the next track skip
+MUSIC_VOL_EVERY = 0.25   # seconds between volume steps while the stick is held up/down
 
 # ---- tuning -------------------------------------------------------------------------
 POINTER_MAX = 1700.0     # px/s at full stick
@@ -101,6 +108,11 @@ KEYS_HELP = """\
  Hold Share ..... join / leave General voice (discord-voice)
  Share ×2 ....... mute / unmute      Share ×3 ....... deafen / undeafen
 
+ MUSIC (Spotify via wow-music, also while a game runs)
+ Hold Share + right stick → / ← ... next / previous track
+ Hold Share + right stick ↑ / ↓ ... music volume
+ Share tap (in a game) ............ play / pause
+
  HOLD VIEW (⧉) +
  D-pad ↑/↓ ...... volume             D-pad ←/→ ...... prev / next track
  A .............. play / pause       Menu ........... mute
@@ -110,7 +122,8 @@ KEYS_HELP = """\
 NOTIFY_HELP = ("A click · X right-click · B Esc · Y keyboard · ≡ Enter\n"
                "LB/RB windows · LT/RT tabs · Xbox overview · L-click precision\n"
                "View+: ↑↓ vol · ←→ track · A play · Y audio · B close · X tab\n"
-               "Share: hold voice join/leave · ×2 mute · ×3 deafen")
+               "Share: hold voice join/leave · ×2 mute · ×3 deafen\n"
+               "Share + R-stick: ←→ track · ↑↓ music volume")
 
 
 def sh(*cmd):
@@ -347,7 +360,10 @@ class Daemon:
         self.legacy = [0.0, 0.0]
         self.share_taps = 0     # Share taps in the current sequence
         self.share_until = 0.0  # sequence ends (and runs) at this time
-        self.share_held = False # the hold already ran voice toggle
+        self.share_held = False # (unused since the hold runs on release; kept for reset)
+        self.share_music = False  # this Share hold was used for music: no voice, no taps
+        self.share_dir = None     # right-stick direction currently held with Share
+        self.share_vol_at = 0.0   # next volume step
 
     @property
     def active(self):
@@ -508,16 +524,48 @@ class Daemon:
         else:
             notify(f"{VOICE} is missing", "Discord voice")
 
+    def music(self, *cmd):
+        log(f"music: {' '.join(cmd)}")
+        if MUSIC.exists():
+            sh(str(MUSIC), *cmd)
+        else:
+            notify(f"{MUSIC} is missing", "Music")
+
+    def share_music_tick(self, now):
+        """Share held + right stick: left/right = track, up/down = volume."""
+        p = self.pad
+        if p is None:
+            return
+        x, y = self.axes.get(p.rx, 0.0), self.axes.get(p.ry, 0.0)
+        if max(abs(x), abs(y)) < MUSIC_REARM:
+            self.share_dir = None
+            return
+        if max(abs(x), abs(y)) < MUSIC_FLICK:
+            return
+        if abs(x) >= abs(y):
+            d = "next" if x > 0 else "prev"
+        else:
+            d = "up" if y < 0 else "down"
+        self.share_music = True
+        if d in ("next", "prev"):
+            if d != self.share_dir:
+                p.rumble(0, 0x7000, 60)
+                self.music(d)
+        elif d != self.share_dir or now >= self.share_vol_at:
+            self.share_vol_at = now + MUSIC_VOL_EVERY
+            self.music("vol", d)
+        self.share_dir = d
+
     def share_tick(self, now):
-        t0 = self.pressed.get("SHARE")
-        if t0 is not None and not self.share_held and now - t0 >= SHARE_HOLD:
-            self.share_held, self.share_taps, self.share_until = True, 0, 0.0
-            self.voice("toggle")
+        if "SHARE" in self.pressed:
+            self.share_music_tick(now)
         if self.share_until and now >= self.share_until and "SHARE" not in self.pressed:
             taps, self.share_taps, self.share_until = self.share_taps, 0, 0.0
             if taps == 1:
                 if self.active:
                     self.out.tap([], K["SYSRQ"])          # screenshot, desktop mode only
+                elif self.game:
+                    self.music("toggle")                  # in a game: play / pause
             elif taps == 2:
                 self.voice("mute")
             elif taps >= 3:
@@ -526,7 +574,8 @@ class Daemon:
     def press(self, name, now):
         self.pressed[name] = now
         if name == "SHARE":
-            self.share_held = False
+            self.share_held = self.share_music = False
+            self.share_dir = None
             if self.fn:
                 self.fn_used = True
             return
@@ -566,10 +615,15 @@ class Daemon:
     def release(self, name, now):
         t0 = self.pressed.pop(name, now)
         if name == "SHARE":
-            if not self.share_held:
+            if self.share_music:                 # the hold was a music gesture
+                self.share_taps, self.share_until = 0, 0.0
+            elif now - t0 >= SHARE_HOLD:          # plain hold, let go: voice join / leave
+                self.share_taps, self.share_until = 0, 0.0
+                self.voice("toggle")
+            else:
                 self.share_taps += 1
                 self.share_until = now + SHARE_TAPS
-            self.share_held = False
+            self.share_music, self.share_dir = False, None
             return
         if name == "GUIDE":
             if not self.guide_fired and self.active and now - t0 < 0.6:
@@ -638,6 +692,8 @@ class Daemon:
         my = self.curve(self.axes.get(ABS_Y, 0.0)) * speed
         sx = self.curve(self.axes.get(p.rx, 0.0)) * SCROLL_MAX * dt
         sy = -self.curve(self.axes.get(p.ry, 0.0)) * SCROLL_MAX * dt
+        if "SHARE" in self.pressed:                # Share + right stick = music, not scrolling
+            sx = sy = 0.0
         moved = False
         for i, (code, v) in enumerate(((REL_X, mx), (REL_Y, my),
                                         (REL_HWHEEL_HI, sx), (REL_WHEEL_HI, sy))):

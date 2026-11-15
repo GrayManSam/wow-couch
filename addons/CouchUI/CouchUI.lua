@@ -11,6 +11,8 @@
 -- /couch layout       re-apply this profile's Edit Mode layout
 -- /couch arrange      move minimap/chat/damage meter/quests out of the way (undo: /couch arrange undo)
 -- /couch macros       (re)create the utility macros
+-- /couch help         controller map: every button, wheel, macro, music + voice shortcut
+--                     (also: "Controls" on the Social wheel, LT + RB). Any button closes it.
 
 local DEFAULTS = {
     Couch = { font = 18 },
@@ -303,6 +305,7 @@ local SOCIAL_MACROS = {
     { "SocFollow", "Ability_Tracking", "/follow" },
     { "SocFriend", "INV_ValentinesCard02", "/friend" },
     { "Leave", 134400, "/leavegroup" },
+    { "Controls", "INV_Misc_Book_09", "/couch help" },
 }
 local SOCIAL_RETIRED = { "SocTarget" }   -- 2.3's auto-target macro: removed
 local SOCIAL_BUTTON = { "RB", "LT" }   -- LT + RB
@@ -392,7 +395,8 @@ local function setupSocial(verbose)
     if verbose or input then
         say("Social wheel" .. (input and (" on " .. (layer ~= "" and layer .. " + " or "") .. input) or
             " ready (no free button - pick one in /ec map)") ..
-            ": invite, inspect, guild invite, trade, follow, add friend, leave group - on your target (LB).")
+            ": invite, inspect, guild invite, trade, follow, add friend, leave group - on your target (LB)." ..
+            " Last slot = Controls (the button map).")
     end
 end
 
@@ -424,6 +428,226 @@ local function patchWhisperNames()
         return list
     end
     ck.couchKnownNames = true
+end
+
+-- ---- Controller map (/couch help) ----------------------------------------------------
+-- One screen with everything the controller does: the live Easy Controller mapping (read
+-- from the addon, so it is always what the buttons really do), the wheels, what each macro
+-- does, and the shortcuts handled outside the game (music = wow-music, Discord voice =
+-- discord-voice, both on the Share button via the `pad` service).
+local MACRO_HELP = {
+    Mount = "Mount up, or dismount if mounted",
+    Hearth = "Use your Hearthstone",
+    Reload = "Reload the UI (fixes most addon hiccups)",
+    Leave = "Leave your party / raid",
+    Controls = "Show this controller map",
+    SocInvite = "Invite your target to your group",
+    SocInspect = "Inspect your target's gear",
+    SocGuild = "Invite your target to your guild",
+    SocTrade = "Open a trade with your target",
+    SocFollow = "Follow your target",
+    SocFriend = "Add your target as a friend",
+    PetAttack = "Pet attacks your mouseover, else your target",
+    PetSummon = "Pet dead: Revive Pet. No pet: Call Pet. Otherwise Mend Pet",
+    MisdTank = "Misdirection on your focus, else on your pet",
+    TrapCursor = "Freezing Trap where the cursor is",
+    MarkMO = "Hunter's Mark on mouseover, else target",
+    FeignDrop = "Stop attacking, pet follows, Feign Death",
+    Interrupt = "Counter Shot on mouseover, else target",
+}
+local MACRO_ORDER = { "Mount", "Hearth", "Reload", "Leave", "PetAttack", "PetSummon", "MisdTank",
+    "TrapCursor", "MarkMO", "FeignDrop", "Interrupt" }
+local HEAD, KEY, DIM = "|cffffd100", "|cffffffff", "|cffb0b0b0"
+local BUTTON_NAME = { UP = "D-pad up", DOWN = "D-pad down", LEFT = "D-pad left",
+    RIGHT = "D-pad right", SELECT = "View", START = "Menu", L3 = "L-stick click",
+    R3 = "R-stick click" }
+local LAYER_HEAD = { [""] = "alone", LT = "hold LT +", RT = "hold RT +", LTRT = "hold LT + RT +" }
+
+local function clip(text, n)
+    text = tostring(text or "")
+    if #text > n then return text:sub(1, n - 2) .. ".." end
+    return text
+end
+
+-- What a button does in a layer, straight from Easy Controller (nil = nothing)
+local function ecAction(M, input, layer)
+    local ok, name = pcall(function()
+        local action = M:GetReplaced(input.id, layer) or M:Get(input.id, layer)
+        if action == M.NOTHING then return nil end
+        if action then return M:ActionName(action) end
+        if M.Inactive and M:Inactive(input, layer) then return nil end
+        return (M:NativeInfo(input, layer))
+    end)
+    if ok and type(name) == "string" and name ~= "" then return name end
+end
+
+local function mapColumns()
+    local ck = _G.ControllerKeyboard
+    local M = ck and ck.Mapping
+    if not (M and M.INPUTS and M.LAYERS) then return nil end
+    local cols = { { HEAD .. "Button|r" } }
+    for i, layer in ipairs(M.LAYERS) do cols[i + 1] = { HEAD .. (LAYER_HEAD[layer] or layer) .. "|r" } end
+    for _, input in ipairs(M.INPUTS) do
+        if not input.paddle and not input.layer then
+            table.insert(cols[1], KEY .. (BUTTON_NAME[input.id] or input.id) .. "|r")
+            for i, layer in ipairs(M.LAYERS) do
+                local name = ecAction(M, input, layer)
+                table.insert(cols[i + 1], name and clip(name, 24) or (DIM .. "-|r"))
+            end
+        end
+    end
+    return cols
+end
+
+local function wheelLines()
+    local out = {}
+    local ck = _G.ControllerKeyboard
+    if not (ck and ck.MyWheels and ck.MyWheels.List) then return out end
+    pcall(function()
+        for _, w in ipairs(ck.MyWheels:List()) do
+            local input, layer = ck.MyWheels:Bound(w.id)
+            local where = input and ((layer and layer ~= "" and
+                (layer == "LTRT" and "LT + RT + " or layer .. " + ") or "") ..
+                (BUTTON_NAME[input] or input)) or "no button (/ec map)"
+            table.insert(out, KEY .. where .. "|r  " .. tostring(w.name or "wheel"))
+        end
+    end)
+    return out
+end
+
+local function helpText()
+    local music = {
+        HEAD .. "MUSIC  (Spotify, starts with WoW)|r",
+        KEY .. "Hold Share + right stick right|r  next track",
+        KEY .. "Hold Share + right stick left|r  previous track",
+        KEY .. "Hold Share + right stick up / down|r  music volume",
+        KEY .. "Tap Share|r  play / pause",
+        " ",
+        HEAD .. "DISCORD VOICE|r",
+        KEY .. "Hold Share 1 s, let go|r  join / leave voice",
+        KEY .. "Share x2|r  mute        " .. KEY .. "Share x3|r  deafen",
+        " ",
+        DIM .. "Share = the small middle button under View / Menu.|r",
+    }
+    local wheels = { HEAD .. "WHEELS  (hold, aim with right stick, let go)|r" }
+    for _, l in ipairs(wheelLines()) do table.insert(wheels, l) end
+    if #wheels == 1 then table.insert(wheels, DIM .. "none (desk mode)|r") end
+    table.insert(wheels, " ")
+    table.insert(wheels, HEAD .. "SOCIAL WHEEL  (acts on your target - pick with LB)|r")
+    table.insert(wheels, "Invite, Inspect, Guild invite, Trade, Follow,")
+    table.insert(wheels, "Add friend, Leave group, Controls (this page)")
+    table.insert(wheels, " ")
+    table.insert(wheels, HEAD .. "OUTSIDE THE GAME|r")
+    table.insert(wheels, KEY .. "Hold Xbox button 1 s|r  controller as mouse on / off")
+    table.insert(wheels, KEY .. "Tap View|r (on the desktop)  desktop button help")
+    local macros = { HEAD .. "MACROS|r" }
+    for _, name in ipairs(MACRO_ORDER) do
+        local ok, idx = pcall(GetMacroIndexByName, name)
+        if ok and idx and idx > 0 then
+            table.insert(macros, KEY .. name .. "|r  " .. MACRO_HELP[name])
+        end
+    end
+    table.insert(macros, " ")
+    table.insert(macros, HEAD .. "COMMANDS|r")
+    table.insert(macros, KEY .. "/couch help|r  this page     " .. KEY .. "/ec map|r  change buttons")
+    table.insert(macros, KEY .. "/cw|r  what is on each spell wheel")
+    table.insert(macros, KEY .. "/couch|r  font, scale, layout, lights")
+    return music, wheels, macros
+end
+
+local helpFrame
+local function buildHelp()
+    local f = CreateFrame("Frame", "CouchUIHelp", UIParent, BackdropTemplateMixin and "BackdropTemplate" or nil)
+    f:SetFrameStrata("DIALOG")
+    f:SetPoint("CENTER")
+    if f.SetBackdrop then
+        f:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8x8", edgeFile = "Interface\\Buttons\\WHITE8x8",
+            edgeSize = 2 })
+        f:SetBackdropColor(0.03, 0.03, 0.06, 0.94)
+        f:SetBackdropBorderColor(0.41, 0.8, 0.94, 0.9)
+    end
+    f.title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalHuge")
+    f.title:SetPoint("TOP", 0, -14)
+    f.title:SetText("Couch controls")
+    f.hint = f:CreateFontString(nil, "OVERLAY", "GameFontDisable")
+    f.hint:SetPoint("BOTTOM", 0, 10)
+    f.hint:SetText("Any controller button or Esc closes this  -  open it again: Social wheel (LT + RB) > Controls")
+    f.cols = {}
+    for i = 1, 8 do
+        local fs = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightMedium")
+        fs:SetJustifyH("LEFT"); fs:SetJustifyV("TOP"); fs:SetSpacing(3)
+        f.cols[i] = fs
+    end
+    f:EnableMouse(true)
+    f:SetScript("OnMouseDown", function(self) self:Hide() end)
+    pcall(function()
+        f:EnableGamePadButton(true)
+        f:SetScript("OnGamePadButtonDown", function(self) self:Hide() end)
+    end)
+    table.insert(UISpecialFrames, "CouchUIHelp")          -- Esc / B closes
+    f:RegisterEvent("PLAYER_REGEN_DISABLED")              -- never in the way in a fight
+    f:SetScript("OnEvent", function(self) self:Hide() end)
+    f:Hide()
+    return f
+end
+
+local function showHelp()
+    if InCombatLockdown() then return say("controller map: not during combat") end
+    helpFrame = helpFrame or buildHelp()
+    local f = helpFrame
+    if f:IsShown() then return f:Hide() end
+    local PAD, GAP = 22, 26
+    local x, top = PAD, -52
+    local gridH, width = 0, 0
+    local cols = mapColumns()
+    for i = 1, 5 do
+        local fs = f.cols[i]
+        fs:ClearAllPoints()
+        if cols and cols[i] then
+            fs:SetText(table.concat(cols[i], "\n"))
+            fs:SetPoint("TOPLEFT", f, "TOPLEFT", x, top)
+            x = x + fs:GetStringWidth() + GAP
+            gridH = math.max(gridH, fs:GetStringHeight())
+            fs:Show()
+        else
+            fs:Hide()
+        end
+    end
+    width = x
+    local a, b, c = helpText()
+    local y = top - (gridH > 0 and gridH + 24 or 0)
+    x = PAD
+    local lowH = 0
+    for i, lines in ipairs({ a, b, c }) do
+        local fs = f.cols[5 + i]
+        fs:ClearAllPoints()
+        fs:SetText(table.concat(lines, "\n"))
+        fs:SetPoint("TOPLEFT", f, "TOPLEFT", x, y)
+        x = x + fs:GetStringWidth() + GAP + 8
+        lowH = math.max(lowH, fs:GetStringHeight())
+    end
+    width = math.max(width, x)
+    local height = -y + lowH + 44
+    f:SetSize(width + PAD - GAP, height)
+    local sw, sh = UIParent:GetWidth() - 40, UIParent:GetHeight() - 40
+    f:SetScale(math.min(1.25, sw / f:GetWidth(), sh / height))
+    f:Show()
+end
+
+-- Macro buttons on the action bars: say in the tooltip what the macro does
+local function hookMacroTips()
+    if not (GameTooltip and hooksecurefunc) then return end
+    pcall(hooksecurefunc, GameTooltip, "SetAction", function(tip, slot)
+        pcall(function()
+            local kind = GetActionInfo(slot)
+            if kind ~= "macro" then return end
+            local text = MACRO_HELP[GetActionText(slot) or ""]
+            if text then
+                tip:AddLine(text, 0.41, 0.8, 0.94, true)
+                tip:Show()
+            end
+        end)
+    end)
 end
 
 local function applyAll(quiet)
@@ -463,6 +687,7 @@ f:SetScript("OnEvent", function()
         local want = CouchUIDB.combatLog ~= false and profileName() == "Couch"
         if want ~= (LoggingCombat() and true or false) then pcall(LoggingCombat, want) end
     end
+    hookMacroTips()
     local last = CouchUIDB.lastProfile
     C_Timer.After(3, function()
         applyAll(last == profileName())
@@ -486,6 +711,7 @@ SlashCmdList.COUCHUI = function(input)
     elseif cmd == "layout" then applyLayout(name); say("layout '" .. name .. "' applied")
     elseif cmd == "arrange" then arrange(name, arg == "undo")
     elseif cmd == "macros" then makeMacros(); makeClassMacros()
+    elseif cmd == "help" or cmd == "map" or cmd == "controls" then showHelp()
     elseif cmd == "lights" then
         CouchUIDB.combatLog = (arg ~= "off")
         pcall(LoggingCombat, CouchUIDB.combatLog)
@@ -501,6 +727,7 @@ SlashCmdList.COUCHUI = function(input)
         end
     else
         say("profile: " .. name .. " | font " .. p.font .. " | scale " .. tostring(p.scale or "default"))
+        say("/couch help = controller map (buttons, wheels, macros, music + voice shortcuts)")
         say("/couch font 18 | /couch scale 0.9 | /couch scale off | /couch layout | /couch arrange [undo] | /couch macros | /couch binds [undo] | /couch social [off|rebind] | /couch lights on|off")
     end
 end

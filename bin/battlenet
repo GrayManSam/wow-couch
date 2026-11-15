@@ -12,10 +12,11 @@
 #   a. couch wow-prep                 per-profile CVars + addons
 #   b. couch wow-display start        TV only while WoW runs (display agent)
 #   c. audio wow start                TV HDMI sink + EasyEffects WoW preset (audio agent)
+#      wow-music start (background)   Spotify minimized, playlist playing (wow-music off = skip)
 #   d. Battle.net --exec="launch WoWF"
 #   e. Wow.exe window appears         -> audio wow route (WoW stream -> TV chain), Battle.net minimized (it also exits by itself:
 #                                        Battle.net.config GameLaunchWindowBehavior=2), WoW focused
-#   f. WoW exits / --kill / TERM,INT,HUP -> audio wow stop, Wine session stopped,
+#   f. WoW exits / --kill / TERM,INT,HUP -> wow-music stop, audio wow stop, Wine session stopped,
 #                                        couch wow-display stop (once per session)
 #   Lights (govee-wow service) follow Wow.exe by themselves.
 #
@@ -48,6 +49,7 @@ STARTUP_GRACE=120    # seconds to wait for the first window to appear
 TIDY_WINDOW=90       # seconds after WoW's window appears during which Battle.net is re-hidden
 COUCH="$HOME/.local/bin/couch"
 AUDIO="$HOME/.local/bin/audio"
+MUSIC="$HOME/.local/bin/wow-music"
 STATE_DIR="$HOME/.cache/battlenet"
 LOG="$STATE_DIR/launch.log"
 SESSION="$STATE_DIR/wow-session"   # exists while the --wow hooks still need their stop step
@@ -116,6 +118,7 @@ wow_teardown() {
     rm -f "$claim"
   fi
   log "f. teardown ($why)"
+  [[ -x "$MUSIC" ]] && hook "f. wow-music stop" 10 "$MUSIC" stop "${dry[@]}"
   has_sub "$AUDIO" wow_stop && hook "f. audio wow stop" 20 "$AUDIO" wow stop "${dry[@]}"
   stop_session
   has_sub "$COUCH" wow-display && hook "f. couch wow-display stop" 30 "$COUCH" wow-display stop "${dry[@]}"
@@ -268,7 +271,9 @@ if [[ "$mode" == wow ]]; then
   trap 'log "signal received"; wow_teardown signal; exit 0' TERM INT HUP
   # a. couch profile: graphics CVars + which UI addons load
   if (( DRY )); then log "a. would run: couch wow-prep"
-  elif [[ -x "$COUCH" ]]; then hook "a. couch wow-prep" 20 "$COUCH" wow-prep
+  elif [[ -x "$COUCH" ]]; then
+    spotify=0; [[ -x "$MUSIC" ]] && "$MUSIC" enabled && spotify=1   # Spotify on -> game music off
+    hook "a. couch wow-prep (spotify=$spotify)" 20 env WOW_SPOTIFY="$spotify" "$COUCH" wow-prep
   else log "a. couch: not installed, skipped"; fi
   # b. display: TV only while WoW runs (before Wine starts, so Wine never sees a re-layout)
   if has_sub "$COUCH" wow-display; then
@@ -279,6 +284,11 @@ if [[ "$mode" == wow ]]; then
   if has_sub "$AUDIO" wow_start; then
     hook "c. audio wow start" 20 "$AUDIO" wow start "${dry[@]}"
   else log "c. audio wow: not available, skipped"; fi
+  # Spotify in the background (slow when it has to launch: never delays the game)
+  if [[ -x "$MUSIC" ]]; then
+    if (( DRY )); then hook "c. wow-music start" 20 "$MUSIC" start --dry-run
+    else ( hook "c. wow-music start" 100 "$MUSIC" start ) & fi
+  fi
 else
   trap 'stop_session; exit 0' TERM INT HUP
   "$COUCH" wow-prep >/dev/null 2>&1

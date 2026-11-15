@@ -639,7 +639,11 @@ def wow_prep():
         return
     # WoW writes CRLF line endings; keep them (normalizing any LF-only lines too).
     text = cfg.read_bytes().decode("utf-8", "replace").replace("\r\n", "\n")
-    for k, v in load_cvars(profile).items():
+    cvars = load_cvars(profile)
+    # Spotify plays during this session (battlenet --wow + wow-music on): game music off, so the
+    # two never play over each other. Every other launch turns the game's own music back on.
+    cvars["Sound_EnableMusic"] = "0" if os.environ.get("WOW_SPOTIFY") == "1" else "1"
+    for k, v in cvars.items():
         line = f'SET {k} "{v}"'
         text, n = re.subn(rf'^SET {re.escape(k)} ".*"$', line, text, flags=re.M)
         if not n:

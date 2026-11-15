@@ -1,0 +1,11 @@
+[Unit]
+Description=Spotify Soloist - headless Spotify player (started on demand by wow-music)
+After=pipewire.service pipewire-pulse.service
+
+[Service]
+EnvironmentFile=%h/.config/wow-music/soloist.env
+ExecStart=%h/.local/bin/soloist --device-name "WoW Couch" --api-key ${SOLOIST_API_KEY} --ws 127.0.0.1:0 --initial-volume 100 --cache-size 1000
+# exit 10 = build expired (wow-music update fetches a new one): do not restart-loop on it
+Restart=on-failure
+RestartPreventExitStatus=10
+RestartSec=5
