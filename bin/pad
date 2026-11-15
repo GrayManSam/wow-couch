@@ -91,6 +91,7 @@ FN = {  # while View is held
     "A": ("tap", [], K["PLAY"]), "MENU": ("tap", [], K["MUTE"]),
     "B": ("tap", [K["ALT"]], K["F4"]), "X": ("tap", [K["CTRL"]], K["W"]),
     "Y": ("call", "audio"),
+    "RS": ("call", "oskmove"),      # move the on-screen keyboard to its next spot
     "LB": ("tap", [K["ALT"]], K["LEFT"]), "RB": ("tap", [K["ALT"]], K["RIGHT"]),
     "LT": ("tap", [K["CTRL"]], K["MINUS"]), "RT": ("tap", [K["CTRL"]], K["EQUAL"]),
 }
@@ -105,7 +106,7 @@ KEYS_HELP = """\
  LT / RT ........ prev / next tab    Xbox tap ....... Activities / search
  Share tap ...... screenshot         View tap ....... show this help
  Keyboard: Y opens / closes it; it also opens by itself when you click a text field.
-           Move it: point at it, hold A, move the left stick. A on a key types it.
+           Move it: hold View and click the right stick: bottom, top, corners, middle.
 
  DISCORD VOICE (also while a game runs)
  Hold Share ..... join / leave General voice (discord-voice)
@@ -122,7 +123,7 @@ KEYS_HELP = """\
  Y .............. switch audio output (runs: audio)
  B .............. close window       X .............. close tab
  LB / RB ........ browser back / fwd LT / RT ........ zoom out / in"""
-NOTIFY_HELP = ("A click · X right-click · B Esc · Y keyboard (hold A on it to move) · ≡ Enter\n"
+NOTIFY_HELP = ("A click · X right-click · B Esc · Y keyboard (View + R-click moves it) · ≡ Enter\n"
                "LB/RB windows · LT/RT tabs · Xbox overview · L-click precision\n"
                "View+: ↑↓ vol · ←→ track · A play · Y audio · B close · X tab\n"
                "Share: hold voice join/leave · ×2 mute · ×3 deafen\n"
@@ -535,6 +536,18 @@ class Daemon:
                 notify("Keyboard helper not loaded yet: log out and back in once")
                 sh("gsettings", "set", "org.gnome.desktop.a11y.applications",
                    "screen-keyboard-enabled", "true")
+        elif what == "oskmove":
+            # GJS OSK rebuilds itself at "default-snap" (0-8 = 3x3 grid, row by row) when
+            # the setting changes and stays open: cycle through the useful spots.
+            order = [7, 1, 6, 8, 0, 2, 4]
+            names = {7: "bottom", 1: "top", 6: "bottom left", 8: "bottom right",
+                     0: "top left", 2: "top right", 4: "middle"}
+            key = "/org/gnome/shell/extensions/gjsosk/default-snap"
+            r = subprocess.run(["dconf", "read", key], capture_output=True, text=True)
+            cur = int(r.stdout.strip()) if r.stdout.strip().isdigit() else 7
+            nxt = order[(order.index(cur) + 1) % len(order)] if cur in order else 7
+            sh("dconf", "write", key, str(nxt))
+            notify(f"Keyboard: {names[nxt]}")
         elif what == "precision":
             self.precision = not self.precision
             notify("Precision pointer " + ("on" if self.precision else "off"))
