@@ -40,6 +40,7 @@ DEFAULT_GAMES = ["Wow.exe", "SteamLaunch", "gamescope"]
 VOICE = Path(os.environ.get("PADMODE_VOICE") or Path.home() / ".local/bin/discord-voice")
 SHARE_HOLD = 0.6         # hold Share this long: join/leave Discord voice
 SHARE_TAPS = 0.35        # gap that ends a Share tap sequence (1 screenshot, 2 mute, 3 deafen)
+GJSOSK = Path.home() / ".local/share/gnome-shell/extensions/gjsosk@vishram1123.com"
 MUSIC = Path(os.environ.get("PADMODE_MUSIC") or Path.home() / ".local/bin/wow-music")
 MUSIC_FLICK = 0.7        # right-stick deflection (with Share held) that counts as a flick
 MUSIC_REARM = 0.4        # stick must come back inside this before the next track skip
@@ -103,6 +104,8 @@ KEYS_HELP = """\
  LB / RB ........ prev / next window (tap again to keep cycling, A picks)
  LT / RT ........ prev / next tab    Xbox tap ....... Activities / search
  Share tap ...... screenshot         View tap ....... show this help
+ Keyboard: Y opens / closes it; it also opens by itself when you click a text field.
+           Move it: point at it, hold A, move the left stick. A on a key types it.
 
  DISCORD VOICE (also while a game runs)
  Hold Share ..... join / leave General voice (discord-voice)
@@ -119,7 +122,7 @@ KEYS_HELP = """\
  Y .............. switch audio output (runs: audio)
  B .............. close window       X .............. close tab
  LB / RB ........ browser back / fwd LT / RT ........ zoom out / in"""
-NOTIFY_HELP = ("A click · X right-click · B Esc · Y keyboard · ≡ Enter\n"
+NOTIFY_HELP = ("A click · X right-click · B Esc · Y keyboard (hold A on it to move) · ≡ Enter\n"
                "LB/RB windows · LT/RT tabs · Xbox overview · L-click precision\n"
                "View+: ↑↓ vol · ←→ track · A play · Y audio · B close · X tab\n"
                "Share: hold voice join/leave · ×2 mute · ×3 deafen\n"
@@ -374,13 +377,24 @@ class Daemon:
 
     def sync_osk(self):
         """On-screen keyboard pops up by itself when a text field is clicked, but only while
-        the controller drives the desktop (GNOME does this whenever its screen-keyboard
-        accessibility switch is on; with a real keyboard in use it would just be in the way)."""
+        the controller drives the desktop (with a real keyboard it would be in the way).
+        GJS OSK (movable: hold A on its top edge / an empty spot and move the left stick):
+        enable-tap-gesture 2 = open for any input, 1 = touch only. Without it: GNOME's own
+        docked keyboard through its accessibility switch."""
         want = bool(self.active)
         if want != getattr(self, "osk_auto", None):
             self.osk_auto = want
-            sh("gsettings", "set", "org.gnome.desktop.a11y.applications",
-               "screen-keyboard-enabled", "true" if want else "false")
+            if GJSOSK.exists():
+                sh("dconf", "write", "/org/gnome/shell/extensions/gjsosk/enable-tap-gesture",
+                   "2" if want else "1")
+                sh("gsettings", "set", "org.gnome.desktop.a11y.applications",
+                   "screen-keyboard-enabled", "false")
+                if not want:
+                    sh("dconf", "write",
+                       "/org/gnome/shell/extensions/gjsosk/indicator/keyboard-visible", "false")
+            else:
+                sh("gsettings", "set", "org.gnome.desktop.a11y.applications",
+                   "screen-keyboard-enabled", "true" if want else "false")
 
     def set_status(self):
         self.sync_osk()
@@ -509,7 +523,10 @@ class Daemon:
 
     # -- actions --
     def call(self, what):
-        if what == "osk":
+        if what == "osk" and GJSOSK.exists():
+            # GJS OSK (movable keyboard): its "opened" switch toggles it
+            sh("dconf", "write", "/org/gnome/shell/extensions/gjsosk/indicator/opened", "true")
+        elif what == "osk":
             # pad-osk@local GNOME extension opens the keyboard directly (GNOME otherwise only
             # shows it after touchscreen input). Fallback: just flip the a11y setting.
             r = subprocess.run(["busctl", "--user", "call", "org.gnome.Shell", "/org/local/PadOsk",

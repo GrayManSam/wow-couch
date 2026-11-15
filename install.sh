@@ -42,4 +42,5 @@ systemctl --user daemon-reload
 systemctl --user enable --now padmode.service couchmode.service xbox-headset.service
 echo "Installed. Install Easy Controller + Bartender4 in WoW, then log out/in once for the OSK extension."
 echo "Music: wow-music playlist <spotify link>; headless player: see README (Spotify Soloist)."
+echo "Movable on-screen keyboard: install the GNOME extension GJS OSK (gjsosk@vishram1123.com)."
 echo "Headset jack (USB-C / Wireless Adapter): sudo ./headset/install-xone.sh   Discord voice: see README."
