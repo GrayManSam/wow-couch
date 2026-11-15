@@ -35,6 +35,10 @@ Per profile, `couch wow-prep` toggles addons in every character's `AddOns.txt`:
 
 `Config.wtf` keeps its CRLF line endings when edited.
 
+Combat logs: CouchUI keeps combat logging on (light sync and smart music read it) and WoW
+never deletes a log, so `couch wow-prep` prunes `Logs/WoWCombatLog*.txt` before every launch:
+the 3 newest stay (as long as they total under 300 MB; the newest always stays).
+
 ## Requirements
 
 - Fedora / any distro with GNOME 49 (Mutter `gdctl`), PipeWire (`pactl`), Python 3.11+.

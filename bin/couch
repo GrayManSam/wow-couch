@@ -632,7 +632,36 @@ def load_cvars(profile):
     return out
 
 
+COMBAT_LOGS_KEEP = 3          # newest combat logs kept
+COMBAT_LOGS_MAX_MB = 300      # ...as long as together they stay under this (newest always stays)
+
+
+def prune_combat_logs():
+    """WoW starts a new WoWCombatLog-*.txt every session and never deletes one. The lights
+    (govee-wow) and smart music (wow-music) only read the current session's file, so before
+    each launch keep the few newest and delete the rest."""
+    try:
+        logs = sorted((WOW / "Logs").glob("WoWCombatLog*.txt"),
+                      key=lambda f: f.stat().st_mtime, reverse=True)
+    except OSError:
+        return
+    total, removed, freed = 0, 0, 0
+    for i, f in enumerate(logs):
+        try:
+            size = f.stat().st_size
+            if i == 0 or (i < COMBAT_LOGS_KEEP and total + size <= COMBAT_LOGS_MAX_MB * 2**20):
+                total += size
+                continue
+            f.unlink()
+            removed, freed = removed + 1, freed + size
+        except OSError:
+            pass
+    if removed:
+        print(f"combat logs: removed {removed} old file(s), {freed / 2**20:.1f} MB")
+
+
 def wow_prep():
+    prune_combat_logs()
     profile = read(CURRENT) or wanted_profile()[0]
     cfg = WOW / "WTF/Config.wtf"
     if not cfg.exists():
