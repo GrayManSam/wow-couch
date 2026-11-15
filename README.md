@@ -16,7 +16,7 @@ GE-Proton (umu-launcher) and an Xbox controller over Bluetooth.
 | `couch wow-display start\|stop` | Screens: with the TV plugged in, the TV is the only screen (4K, 200% scale, 60 Hz by default: the 3rd-gen Framework HDMI card is HDMI 2.0b and goes black at 4K120; after a 4th-gen card / HDMI 2.1 adapter put `120` in `~/.config/gameprofile/tv-max-hz`, laptop panel off) while the lid is closed, while a WoW session runs (`wow-display start`, the launcher calls it; the previous layout is saved and `stop` restores it), or after `couch on`. Lid open again -> laptop + TV come back. `--dry-run` checks layouts with `gdctl set --verify`. The service never changes the layout while WoW/Battle.net runs (Wine crashes on a monitor reconfigure). |
 | `bin/battlenet` | Battle.net / WoW launcher for GE-Proton + umu, with a watchdog that cleans up the invisible "closed to tray" Battle.net session, and ends a Wow.exe left hung after the in-game **Exit Game** (client destroyed, window gone). Runs `couch wow-prep` before every launch. |
 | `profiles/wow-*.cvars` | WoW graphics/gamepad CVars applied per profile before launch (render scale, vsync, FPS cap, GamePadEnable, soft targeting). |
-| `addons/CouchUI` | In game: switches Edit Mode layout ("Couch"/"Desk"), chat font and UI scale by profile; `/couch arrange` moves minimap/chat/damage meter/quests out of the way; sets sensible desk keybinds once (`/couch binds undo` restores). Couch: a **Social** mini wheel on LT + RB — invite, inspect, guild invite, trade, follow, add friend, leave group, all on your current target (pick it with LB / assist; nothing is auto-targeted); your target is offered first for `/w` on Easy Controller's keyboard. `/couch social [off\|rebind]`. **`/couch help`** (or *Controls* on the Social wheel) shows the controller map: every button in every layer read live from Easy Controller, the wheels, what each macro does, and the music / voice shortcuts; macro buttons say what they do in their tooltip. |
+| `addons/CouchUI` | In game: switches Edit Mode layout ("Couch"/"Desk"), chat font and UI scale by profile; `/couch arrange` moves minimap/chat/damage meter/quests out of the way; sets sensible desk keybinds once (`/couch binds undo` restores). Couch: a **Social** mini wheel on LT + RT + D-pad left — invite, inspect, the target's menu, trade, follow, add friend, leave group, all on your current target (pick it with LB / assist); your target is offered first for `/w` on Easy Controller's keyboard. `/couch social [off\|rebind]`. (RB alone stays the game's enemy targeting: Easy Controller can only read LT + RB if RB alone is taken from the game.) **Hunter** macros (Fight, Panic potion, pet, stings, mark...) replace their spells on your buttons and wheels, plus a Hunter wheel and an **Emote** wheel. **Recruit** (LT + D-pad right): targets the nearest player of your faction with no guild (or keeps your own target) and invites them — see *Guild invites* below. **Quest item** button: the usable item of your current quest (the one you just looted, else the nearest quest's) on one empty controller button, `/couch questitem`. **Auto bag sort**: the game's own Clean Up Bags runs when you close your bags after something changed (never in a fight or at a vendor / bank / mailbox), `/couch sort on\|off\|now`. Logs any action WoW blocks (chat + `CouchUIDB.blocked`). **`/couch help`** (or *Controls* on the Social wheel) shows the controller map: every button in every layer read live from Easy Controller, the wheels, what each macro does, and the music / voice shortcuts; macro buttons say what they do in their tooltip. |
 | `addons/CouchWheels` | Fills Easy Controller's radial wheels with every spell, ability and profession you know, and keeps them up to date as you learn new ones. |
 | `bin/xbox-bt-tune` | One-time root script: udev rule so SDL/Proton can use the controller's hidraw node (correct layout, Guide button, rumble), and a low-latency Bluetooth LE connection interval. |
 | `bin/audio` | Sound for WoW sessions: `audio wow start\|stop\|route` puts the game on the TV (unmuted, volume set — new HDMI routes start at 40%/-24 dB otherwise), optional EasyEffects presets; `audio wow doctor` prints the whole chain and plays 3 test beeps through the TV. |
@@ -30,8 +30,10 @@ Per profile, `couch wow-prep` toggles addons in every character's `AddOns.txt`:
 
 - couch: Easy Controller + CouchWheels
 - desk: Bartender4
-- always: CouchUI (+ CouchLights from [govee-wow](https://github.com/GrayManSam/govee-wow) if installed)
-- never: ConsolePort (it taints Forever's own gamepad UI: "execution tainted by 'ConsolePort'")
+- always: CouchUI (+ CouchLights from [govee-wow](https://github.com/GrayManSam/govee-wow) if installed),
+  and if installed Auctionator, Pawn, Questie + QuestieDB, TomTom, GTFO
+- never: ConsolePort (it taints Forever's own gamepad UI: "execution tainted by 'ConsolePort'"),
+  QuestieTrace (Questie's optional gameplay recorder)
 
 `Config.wtf` keeps its CRLF line endings when edited.
 
@@ -46,7 +48,10 @@ the 3 newest stay (as long as they total under 300 MB; the newest always stays).
   `bin/battlenet`). Default game folder:
   `~/Games/battlenet/drive_c/Program Files (x86)/World of Warcraft/_forever_` — set `WOW_DIR`
   if yours differs.
-- Addons from CurseForge/Wago: **Easy Controller** (couch), **Bartender4** (desk).
+- Addons from CurseForge/Wago: **Easy Controller** (couch), **Bartender4** (desk). Suggested,
+  all with Forever builds: Auctionator (Wago), Pawn, TomTom, GTFO (WoWInterface), Questie
+  (GitHub releases). GTFO: open its settings with `/gtfo options`, not from the Options window
+  (its panel there gets the gamepad UI's actions blocked while it is open).
 - Your user needs access to `/dev/uinput` and the controller's event device for `pad`
   (input group or a udev rule).
 
@@ -81,10 +86,15 @@ Open-source players (spotifyd, librespot...) no longer work: Spotify refuses the
 
 **Smart mode** (default once scanned; headless player only): `wow-music scan` reads the whole
 playlist, listens to each song's 30 s preview and sorts the songs into calm / steady / intense
-by loudness and punch. While you play, the music follows the game through the combat log
-(CouchUI turns logging on): calm while exploring or in a city, steady in dungeons and raids,
-intense for boss fights, PvP and fights longer than 8 s; changes fade and are at least 25 s
-apart (bosses switch at once). `wow-music moods all` shows the sorting, `wow-music tag
+by loudness and punch. While you play it works like a game's own music engine, reading the
+combat log (CouchUI turns logging on): a song always plays to its end, and where you are decides
+the *next* one — calm exploring or in a city, steady in dungeons and raids, one step livelier
+while you fight a lot. Only a boss (at once), PvP or one fight of 45 s+ out in the world cut in
+with battle music, and afterwards the interrupted song continues where it stopped. No song comes
+back until most of its mood was heard (remembered across sessions, never the same artist twice
+in a row); a silent intro is skipped the first time (the player's own stream is measured with
+`parec`) and remembered, silent endings are cut. Share + right stick left restarts the song, or
+goes back one in its first 8 s. `wow-music moods all` shows the sorting, `wow-music tag
 calm|steady|intense` re-sorts the song that is playing, `wow-music mode random` is plain
 shuffle. Situations, zones and timings are in `~/.config/wow-music/config.json`.
 
@@ -112,6 +122,18 @@ battlenet --wow       launch straight into WoW Forever
 Tune per-machine values at the top of the scripts: the laptop panel mode in `couch`
 (`LAPTOP_MODE`), pointer speed / dead zone in `pad`, the games that pause `pad` in
 `~/.config/padmode/games`.
+
+## Guild invites
+
+WoW Forever forbids guild invites from addons and macros (`C_GuildInfo.Invite` — "macro script
+has been blocked"); only a typed `/ginvite` goes through, and `/ginvite` with no name invites
+the target. So the **Recruit** macro only targets, and the PC types the invite: CouchUI flashes
+an event on the CouchLights strip, govee-wow sees it in its screen capture and types Enter,
+`/ginvite`, Enter, Esc into the game with `xdotool` (needs govee-wow running with the strip).
+Each press asks one player; nobody is asked twice (`/couch recruit` = stats, `reset`). Keep the
+chat box closed when you press it. `pad` has an older button-based trigger (LT + D-pad right,
+`touch ~/.config/padmode/recruit`); it misses presses because Easy Controller keeps the LT layer
+on after LT is released, so it is off by default.
 
 ## Headset and Discord
 

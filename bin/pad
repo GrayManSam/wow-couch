@@ -25,6 +25,7 @@ import select
 import struct
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -45,6 +46,13 @@ MUSIC = Path(os.environ.get("PADMODE_MUSIC") or Path.home() / ".local/bin/wow-mu
 MUSIC_FLICK = 0.7        # right-stick deflection (with Share held) that counts as a flick
 MUSIC_REARM = 0.4        # stick must come back inside this before the next track skip
 MUSIC_VOL_EVERY = 0.25   # seconds between volume steps while the stick is held up/down
+# WoW guild Recruit (CouchUI): LT + D-pad right runs the in-game Recruit macro, which targets
+# the next player near you with no guild. WoW Forever blocks guild invites from macros and
+# addons but not typed ones, so pad then types "/ginvite" + Enter (no name = your target) and
+# Esc to close the chat again. Off: rm ~/.config/padmode/recruit
+RECRUIT = CONF / "recruit"
+RECRUIT_DELAY = 0.35     # let the macro target the player first
+RECRUIT_KEYS = [53, 34, 23, 49, 47, 23, 20, 18]   # / g i n v i t e  (US layout key codes)
 
 # ---- tuning -------------------------------------------------------------------------
 POINTER_MAX = 1700.0     # px/s at full stick
@@ -617,6 +625,14 @@ class Daemon:
 
     def press(self, name, now):
         self.pressed[name] = now
+        lt = getattr(self, "lt_val", 0.0)
+        rt = getattr(self, "rt_val", 0.0)
+        lt_ago = now - getattr(self, "lt_seen", -99.0)
+        if self.game and name in ("DR", "LT"):
+            log(f"recruit: {name} down, LT={lt:.2f}, LT touched {lt_ago:.2f}s ago")
+        if name == "DR" and (lt > 0.1 or lt_ago < 0.8) and rt < 0.5 \
+                and self.game and "wow" in self.game.lower() and RECRUIT.exists():
+            self.recruit_at = now + RECRUIT_DELAY
         if name == "SHARE":
             self.share_held = self.share_music = False
             self.share_dir = None
@@ -703,6 +719,9 @@ class Daemon:
             elif code in (p.lt, p.rt):
                 name = "LT" if code == p.lt else "RT"
                 v = p.norm(code, value)
+                setattr(self, "lt_val" if name == "LT" else "rt_val", v)  # recruit: light press
+                if name == "LT" and v > 0.1:
+                    self.lt_seen = now          # recruit: LT tapped just before D-pad right
                 if v > 0.6 and name not in self.pressed:
                     self.press(name, now)
                 elif v < 0.4 and name in self.pressed:
@@ -717,7 +736,21 @@ class Daemon:
         a = ((a - DEADZONE) / (1 - DEADZONE)) ** CURVE
         return a if v > 0 else -a
 
+    def recruit_type(self):
+        """Enter, /ginvite, Enter, Esc - real key presses into the game (see RECRUIT)."""
+        def go():
+            seq = [(K["ENTER"], [])] + [(c, []) for c in RECRUIT_KEYS] + \
+                [(K["ENTER"], []), (K["ESC"], [])]
+            for i, (code, mods) in enumerate(seq):
+                self.out.tap(mods, code)
+                time.sleep(0.25 if i == 0 or code == K["ENTER"] else 0.03)
+            log("recruit: typed /ginvite")
+        threading.Thread(target=go, daemon=True).start()
+
     def tick(self, now, dt):
+        if getattr(self, "recruit_at", 0.0) and now >= self.recruit_at:
+            self.recruit_at = 0.0
+            self.recruit_type()
         if "GUIDE" in self.pressed and not self.guide_fired \
                 and now - self.pressed["GUIDE"] >= GUIDE_HOLD:
             self.guide_fired = True

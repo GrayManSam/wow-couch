@@ -41,10 +41,13 @@ LAPTOP_MODE = ("eDP-1", "2560x1600", 1.3333333730697632)
 # Forever ("execution tainted by 'ConsolePort'"), so it is never enabled in either mode.
 COUCH_ADDONS_ON = ["EasyController", "CouchWheels"]
 DESK_ADDONS_ON = ["Bartender4"]
-ALWAYS_ON = ["CouchUI", "CouchLights"]          # profile switcher + room-light bridge
+ALWAYS_ON = ["CouchUI", "CouchLights",          # profile switcher + room-light bridge
+             # 2026-11-15: auction house, gear upgrades, quests, waypoints, danger alerts
+             "Auctionator", "Pawn", "Questie", "QuestieDB", "TomTom", "GTFO"]
 ALWAYS_OFF = ["ConsolePort", "ConsolePort_Bar", "ConsolePort_Config", "ConsolePort_Cursor",
               "ConsolePort_Keyboard", "ConsolePort_Menu", "ConsolePort_Rings",
-              "ConsolePort_Target", "ConsolePort_World"]
+              "ConsolePort_Target", "ConsolePort_World",
+              "QuestieTrace"]   # Questie's optional data recorder: not needed to play
 
 DEFAULT_CVARS = {
     # TV: 4K output, render at 50% (1080p) and FSR-upscale; the 860M can't render native 4K.

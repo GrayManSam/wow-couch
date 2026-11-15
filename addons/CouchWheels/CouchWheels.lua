@@ -51,10 +51,20 @@ local function collect()
     local SB = C_SpellBook
     if not (SB and SB.GetNumSpellBookSkillLines) then return nil end
     local seen, combat, profs, general = {}, {}, {}, {}
+    -- CouchUI's hunter macros stand in for their spell (Hunter's Mark -> MarkMO...)
+    local macroFor = _G.CouchUI_MacroForSpell
     local function add(list, item)
         if usable(item) and not seen[item.spellID] then
             seen[item.spellID] = true
-            list[#list + 1] = "spell:" .. item.spellID
+            local action = "spell:" .. item.spellID
+            if macroFor then
+                local ok, name = pcall(macroFor, item.spellID)
+                if ok and type(name) == "string" then action = "macro:" .. name end
+            end
+            if not seen[action] then
+                seen[action] = true
+                list[#list + 1] = action
+            end
         end
     end
     -- Professions first, so they are not counted twice in another tab
@@ -293,6 +303,9 @@ local function soon(delay)
     end)
 end
 
+-- For CouchUI: a macro was made or removed, the wheels follow
+function CouchWheels_Refill() if db then soon(1) end end
+
 f:RegisterEvent("ADDON_LOADED")
 f:RegisterEvent("PLAYER_ENTERING_WORLD")
 f:RegisterEvent("SPELLS_CHANGED")
@@ -347,6 +360,7 @@ SlashCmdList.COUCHWHEELS = function(input)
                 for i = 1, SLOTS do
                     local id = w.slots[i] and tonumber(w.slots[i]:match("^spell:(%d+)$"))
                     local name = id and C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(id)
+                    name = name or (w.slots[i] and w.slots[i]:match("^macro:(.+)$"))
                     if name then names[#names + 1] = name end
                 end
                 local input, layer = ck.MyWheels:Bound(w.id)

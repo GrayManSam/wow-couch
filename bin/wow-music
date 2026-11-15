@@ -12,9 +12,14 @@
   wow-music playlist [URL|URI]     show / set what `start` plays (playlist, album, artist)
   wow-music pair        one-time: connect the headless player to your Spotify account
   wow-music update      download the current Soloist build (they expire after 90 days)
-  wow-music mode [smart|random]    smart = the music follows the game (headless player only):
-                        calm songs while exploring / in town, steady in dungeons and raids,
-                        intense for bosses, PvP and long fights. random = plain shuffle.
+  wow-music mode [smart|random]    smart = the music follows the game like a game's own music
+                        engine (headless player only): a song always plays to its end, and
+                        where you are decides the NEXT one (calm exploring / in town, steady
+                        in dungeons and raids, one step livelier while you fight a lot). Only
+                        a boss, PvP or one long fight cuts in with battle music; afterwards the
+                        song it interrupted continues where it stopped. No song comes back
+                        until most of its mood was heard (kept across sessions), silent intros
+                        are skipped and remembered, silent endings cut. random = plain shuffle.
   wow-music scan        listen to the playlist's song previews and sort them by intensity
                         (needed once for smart mode, again after you add songs)
   wow-music moods [calm|steady|intense]   how the songs were sorted
@@ -35,15 +40,18 @@ build is 60 days old). Not paired / broken / "player": "app" in the config -> th
 desktop app is launched minimized instead (MPRIS over busctl, volume via its PipeWire stream).
 A desktop app that is already playing is left alone. Stdlib only.
 Smart mode reads the game's combat log (WoW/Logs/WoWCombatLog*.txt, CouchUI turns logging
-on), so it reacts a few seconds after the game does; song changes fade. Songs come from the
+on), so it reacts a few seconds after the game does; battle changes fade. Songs come from the
 playlist itself: add songs to the playlist in Spotify, run `wow-music scan`.
 Config: ~/.config/wow-music/config.json   Song library: ~/.config/wow-music/library.json
 """
+import collections
 import json
 import os
+import random
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -68,9 +76,12 @@ DEFAULTS = {
         "Warsong Gulch": "pvp", "Arathi Basin": "pvp", "Alterac Valley": "pvp",
         "Eye of the Storm": "pvp", "Arena": "pvp",
     },
-    "combat_after": 8,    # seconds a fight must last before the music turns intense
-    "calm_after": 15,     # seconds without fighting before it settles again
-    "min_dwell": 25,      # at least this long between two mood changes (bosses ignore it)
+    "battle_after": 45,   # seconds one fight must last before battle music cuts in
+    "calm_after": 15,     # seconds without fighting before the fight counts as over
+    "battle_hold": 40,    # battle music stays at least this long (bosses cut in at once)
+    "busy_share": 0.3,    # fighting this share of the last 3 minutes: next song one step livelier
+    "intro_db": -40,      # quieter than this (dB at full volume) = intro / ending, not music
+    "intro_max": 75,      # look for the music's start in the first N seconds only
     "quality": "lossless",  # lossless (FLAC, up to 24-bit/44.1 kHz) | very_high (320) | high (160)
     "eq": True,           # music through its own TV-speaker EQ while the TV is the output
     "eq_preamp": -4.0,    # dB, keeps the boosts below from clipping
@@ -375,8 +386,18 @@ def soloist_start(cfg, uri, session):
         time.sleep(0.5)
     ctl("activate")
     ctl("volume", str(cfg["volume"] if cfg["volume"] is not None else 70))
-    ctl("shuffle", "on" if cfg["shuffle"] else "off")
-    deadline = time.monotonic() + 30
+    smart = smart_wanted(cfg)
+    lead = 0
+    if smart:                                     # smart mode opens on a song of its own choice
+        lib = load_library()
+        playlist, uri = uri, pick_song(lib, cfg["moods"].get("world", "calm"))
+        lead = lib["tracks"][uri].get("lead", 0)
+        ctl("shuffle", "off")
+    else:
+        ctl("shuffle", "on" if cfg["shuffle"] else "off")
+        if cfg["shuffle"]:
+            ctl("volume", "0")                    # a playlist always opens on its first song:
+    deadline = time.monotonic() + 30              # not heard, skipped right below
     while True:
         ctl("play", uri)
         time.sleep(2.0)
@@ -385,9 +406,13 @@ def soloist_start(cfg, uri, session):
         if time.monotonic() > deadline:
             log("Soloist did not start playing in 30s")
             return False
-    if cfg["shuffle"]:
-        ctl("next")                               # so the session does not always open on track 1
+    if smart:
+        if lead > 3000:
+            ctl("seek", str(lead))
+    elif cfg["shuffle"]:
+        ctl("next")
         time.sleep(0.8)
+        ctl("volume", str(cfg["volume"] if cfg["volume"] is not None else 70))
     session["started"] = True
     SESSION.write_text(json.dumps(session))
     log(f"playing {uri} (headless): {soloist_track()}")
@@ -705,8 +730,9 @@ def control(cmd):
         if cmd == "next" and smart:                 # smart mode: another song of this mood
             run("systemctl", "--user", "kill", "-s", "USR1", SMART_UNIT)
             time.sleep(1.6)
-        elif cmd == "prev" and smart:
-            ctl("seek", "0")                        # no song history in smart mode: restart it
+        elif cmd == "prev" and smart:               # restart the song / the one before it
+            run("systemctl", "--user", "kill", "-s", "USR2", SMART_UNIT)
+            time.sleep(1.6)
         else:
             ctl(cmd)
         time.sleep(0.5)
@@ -1009,6 +1035,7 @@ class Game:
         self.last_fight = float("-inf")
         self.last_pvp = float("-inf")
         self.clock = 0.0                # newest game time seen
+        self.fights = collections.deque(maxlen=60)      # [start, end] of the recent fights
 
     def feed(self, line):
         parts = line.split("  ", 1)
@@ -1045,21 +1072,31 @@ class Game:
             if out or taken:
                 if ts - self.last_fight > self.cfg["calm_after"]:
                     self.fight_start = ts
+                    self.fights.append([ts, ts])
+                elif self.fights:
+                    self.fights[-1][1] = ts
                 self.last_fight = ts
                 if (dfl if out else sfl) & F_PLAYER:
                     self.last_pvp = ts
 
+    def busy(self, now, window=180):
+        """Share of the last three minutes spent fighting (a kill counts 2 s at least)."""
+        lo = now - window
+        return sum(max(0.0, min(e + 2, now) - max(st, lo)) for st, e in self.fights) / window
+
     def situation(self, now):
-        """(situation, urgent). `now` = wall clock; the log's own times decide what is recent."""
-        quiet = now - self.last_fight
+        """(situation, level). Level 0 = a place: it only decides the next song. 1 = battle
+        (PvP, or one long fight out in the world): cuts in. 2 = boss: cuts in at once.
+        `now` = wall clock; the log's own times decide what is recent."""
         if self.boss:
-            return "boss", True
+            return "boss", 2
         if now - self.last_pvp < 30:
-            return "pvp", False
-        if quiet < self.cfg["calm_after"] and self.fight_start is not None \
-                and self.last_fight - self.fight_start >= self.cfg["combat_after"]:
-            return "combat", False
-        return self.place, False
+            return "pvp", 1
+        if self.place not in ("dungeon", "raid") and self.fight_start is not None \
+                and now - self.last_fight < self.cfg["calm_after"] \
+                and self.last_fight - self.fight_start >= self.cfg["battle_after"]:
+            return "combat", 1
+        return self.place, 0
 
 
 class LogTail:
@@ -1086,83 +1123,302 @@ class LogTail:
         return [ln.decode("utf-8", "replace") for ln in done]
 
 
+# ---- smart mode: no repeats, loudness meter -------------------------------------------
+HISTORY = CONF / "history.json"
+
+
+def load_history():
+    try:
+        h = json.loads(HISTORY.read_text())
+        return h if isinstance(h, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def remember(uri):
+    """Played songs, oldest first. Kept across sessions so a new session does not replay them."""
+    h = [u for u in load_history() if u != uri] + [uri]
+    try:
+        CONF.mkdir(parents=True, exist_ok=True)
+        HISTORY.write_text(json.dumps(h[-600:]))
+    except OSError:
+        pass
+
+
+def first_artist(t):
+    return (t or {}).get("artist", "").split(",")[0].strip()
+
+
+def pick_song(lib, mood, not_artist=None):
+    """A song of this mood that was not among the last 70 % of that mood's songs you heard,
+    and not by the artist that just played."""
+    tracks = lib["tracks"]
+    pool = [u for u, t in tracks.items() if t.get("mood") == mood] or list(tracks)
+    members = set(pool)
+    heard = [u for u in load_history() if u in members]
+    n = int(len(pool) * 0.7)
+    block = set(heard[-n:]) if n else set()
+    fresh = [u for u in pool if u not in block] or pool
+    if not_artist:
+        fresh = [u for u in fresh if first_artist(tracks[u]) != not_artist] or fresh
+    return random.choice(fresh)
+
+
+class Meter(threading.Thread):
+    """How loud the player's own stream is right now: four readings a second, in dB as it
+    leaves the player (so after its volume). Used to find silent intros and endings."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.samples = collections.deque(maxlen=480)        # (monotonic, dB): two minutes
+        self.proc = None
+
+    def run(self):
+        import array, math
+        while True:
+            ss = streams()
+            if not ss:
+                time.sleep(3)
+                continue
+            try:
+                self.proc = subprocess.Popen(
+                    ["parec", f"--monitor-stream={ss[0][0]}", "--format=s16le", "--rate=8000",
+                     "--channels=1", "--latency-msec=100"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            except OSError:
+                return                                      # no parec: no intro skipping
+            while True:
+                data = self.proc.stdout.read(4000)          # a quarter of a second
+                if len(data) < 4000:
+                    break
+                pcm = array.array("h")
+                pcm.frombytes(data)
+                rms = math.sqrt(sum(x * x for x in pcm) / len(pcm))
+                self.samples.append((time.monotonic(), 20 * math.log10(rms / 32768 + 1e-7)))
+            self.proc.wait()
+            time.sleep(2)
+
+    def since(self, t):
+        return [db for ts, db in list(self.samples) if ts >= t]
+
+    def check(self):
+        """The stream went away (player restarted): start over on the new one."""
+        last = self.samples[-1][0] if self.samples else 0
+        if self.proc and self.proc.poll() is None and time.monotonic() - last > 8:
+            self.proc.kill()
+
+    def close(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.kill()
+
+
+def full_scale(levels, vol):
+    """Readings as they would be at volume 100 (the player's volume curve is cubic)."""
+    import math
+    gain = 60 * math.log10(max(1, vol) / 100)
+    return [db - gain for db in levels]
+
+
 # ---- smart mode: the DJ -------------------------------------------------------------
 class DJ:
-    """Keeps a song of the wanted mood playing on Soloist. Each song is started by itself and
-    the next one is started just before it ends. (Spotify's queue is not used: it cannot be
-    cleared, so songs queued for a fight would still play after it.)"""
+    """Works like a game's music engine. A song plays to its end; where you are and how much
+    you are fighting decide the NEXT song. Only a boss, PvP or a long fight interrupts, and
+    afterwards the interrupted song continues where it stopped. Songs do not repeat until most
+    of their mood has been heard, a silent intro is skipped (and remembered), and a silent
+    ending is cut. Each song is started by itself just before the last one ends (Spotify's
+    queue is not used: it cannot be cleared)."""
 
-    def __init__(self, cfg, lib):
-        import random
-        self.cfg, self.rng = cfg, random.Random()
-        self.by_mood = {m: [u for u, t in lib["tracks"].items() if t.get("mood") == m]
-                        for m in MOODS}
-        self.recent = []
-        self.mood = None
+    def __init__(self, cfg, lib, meter):
+        self.cfg, self.lib, self.meter = cfg, lib, meter
+        self.mood = None                # mood of the song that is playing
         self.current = None
-        self.skip = False               # `wow-music next` asked for another song
-        self.hands_off = False          # you picked something else: left alone until the next change
+        self.started = 0.0              # monotonic: song start / last seek / last resume
+        self.pending = 0.0              # until then the player may still report the old song
+        self.probing = False            # still looking for where the music begins
+        self.probe_pos = 0
+        self.skip = self.back = False   # wow-music next / prev
+        self.hands_off = False          # you picked something else: left alone until `next`
+        self.battle = False             # battle music is on
+        self.resume = None              # (uri, position ms, mood, monotonic) a battle interrupted
         self.switched = float("-inf")
+        self.played = []                # this session, for `prev`
+
+    def has_songs(self):
+        return any(t.get("mood") for t in self.lib["tracks"].values())
+
+    def title(self, uri):
+        t = self.lib["tracks"].get(uri, {})
+        return f"{first_artist(t) or '?'} - {t.get('title', uri)}"
 
     def pick(self, mood):
-        pool = self.by_mood.get(mood) or [u for m in MOODS for u in self.by_mood[m]]
-        fresh = [u for u in pool if u not in self.recent] or pool
-        uri = self.rng.choice(fresh)
-        self.recent = (self.recent + [uri])[-max(1, min(20, len(pool) // 2)):]
-        return uri
+        return pick_song(self.lib, mood, first_artist(self.lib["tracks"].get(self.current)))
+
+    def play(self, uri, at=None):
+        t = self.lib["tracks"].get(uri, {})
+        self.probing = at is None and "lead" not in t
+        if at is None:
+            at = t.get("lead", 0)
+        ctl("play", uri)
+        if at > 3000:
+            for _ in range(20):
+                if (soloist_now().get("item") or {}).get("uri") == uri:
+                    break
+                time.sleep(0.15)
+            ctl("seek", str(int(at)))
+        self.current, self.probe_pos = uri, 0
+        self.started = time.monotonic()
+        self.pending = self.started + 4
+        self.skip = False
+        if not self.played or self.played[-1] != uri:
+            self.played.append(uri)
+        remember(uri)
+        log(f"  > {self.title(uri)}  [{t.get('mood', '?')}]"
+            + (f"  from {int(at) // 1000}s" if at > 3000 else ""))
+
+    def next_song(self, mood):
+        self.mood = mood
+        self.play(self.pick(mood))
 
     def fade(self, lo, hi, steps, pause):
         for i in range(1, steps + 1):
             ctl("volume", str(round(lo + (hi - lo) * i / steps)))
             time.sleep(pause)
 
-    def switch(self, mood, why, urgent=False):
+    def change(self, mood, why, urgent, uri, at=None):
+        """Fade out, another song, fade in."""
         vol = find(soloist_now(), "volume")
         vol = int(vol) if isinstance(vol, (int, float)) and vol > 5 else (self.cfg["volume"] or 70)
-        first = self.pick(mood)
         log(f"{why}: {self.mood or 'start'} -> {mood}")
         try:
-            self.fade(vol, vol * 0.25, 2 if urgent else 5, 0.12 if urgent else 0.3)
+            self.fade(vol, vol * 0.25, 2 if urgent else 6, 0.12 if urgent else 0.3)
             ctl("shuffle", "off")
-            ctl("play", first)
-            self.current = first
-            self.fade(vol * 0.25, vol, 3, 0.15)
+            self.mood = mood
+            self.play(uri, at)
+            self.fade(vol * 0.25, vol, 4, 0.2)
         finally:
             ctl("volume", str(vol))                 # also when stopped in the middle of a fade
-        self.mood, self.hands_off, self.switched = mood, False, time.monotonic()
+        self.hands_off = False
+        self.switched = self.started = time.monotonic()
 
-    def play_next(self):
-        self.current = self.pick(self.mood)
-        ctl("play", self.current)
-        self.skip = False
+    def begin(self, now, mood):
+        """Daemon start: a library song that is already playing is kept."""
+        uri = (now.get("item") or {}).get("uri")
+        t = self.lib["tracks"].get(uri)
+        if t is None:
+            self.next_song(mood)
+            return
+        self.current, self.mood = uri, mood
+        self.started = time.monotonic()
+        self.probing = "lead" not in t and self.position(now)[0] < 15000
+        self.played.append(uri)
+        remember(uri)
+        log(f"  = {self.title(uri)}  (already playing: kept)")
 
-    def follow(self, now):
+    @staticmethod
+    def position(now):
+        """(position ms, ms left) of the playing song."""
+        try:
+            p = now["position"]
+            pos = p["position_ms"] + (time.time() * 1000 - p["timestamp_ms"])
+            return pos, now["item"]["decorations"]["playback"]["duration_ms"] - pos
+        except (KeyError, TypeError):
+            return 0, 10 ** 9
+
+    def interrupt(self, now, mood, why, urgent):
+        """Boss / PvP / long fight: battle music now. The song is kept for afterwards."""
+        pos, left = self.position(now)
+        if (now.get("item") or {}).get("uri") == self.current and left > 30000:
+            self.resume = (self.current, pos, self.mood, time.monotonic())
+        self.battle = True
+        self.change(mood, why, urgent, self.pick(mood))
+
+    def settle(self, mood, why):
+        """The battle is over: back into the interrupted song, or a new one of the place."""
+        self.battle = False
+        r, self.resume = self.resume, None
+        if r and time.monotonic() - r[3] < 600:
+            self.change(r[2], why + ", back to the song", False, r[0], at=max(0, r[1] - 2000))
+        else:
+            self.change(mood, why, False, self.pick(mood))
+
+    def set_lead(self, uri, lead):
+        lib = load_library()                        # `tag` / `scan` may have written meanwhile
+        if uri in lib.get("tracks", {}):
+            lib["tracks"][uri]["lead"] = int(lead)
+            save_library(lib)
+            self.lib = lib
+
+    def probe(self, pos, left, vol):
+        """First time a song is heard: while nothing audible comes out, jump ahead 10 s at a
+        time. Where the music began is remembered, so next time it starts right there."""
+        mono = time.monotonic()
+        if mono - self.started < 4.5:
+            return
+        lv = full_scale(self.meter.since(max(self.started + 0.8, mono - 4)), vol)
+        if len(lv) < 10:
+            return
+        lv.sort()
+        if lv[len(lv) * 3 // 4] >= self.cfg["intro_db"]:        # music
+            self.probing = False
+            self.set_lead(self.current, self.probe_pos)
+            if self.probe_pos:
+                log(f"    intro learned: this song starts at {self.probe_pos // 1000}s from now on")
+        elif pos >= self.cfg["intro_max"] * 1000 or left < 60000:
+            self.probing = False                    # simply a quiet song: never skip into it again
+            self.set_lead(self.current, 0)
+            log("    quiet all the way: treated as a quiet song, not an intro")
+        else:
+            self.probe_pos = int(pos) + 10000
+            ctl("seek", str(self.probe_pos))
+            self.started = mono
+            log(f"    quiet intro ({lv[len(lv) * 3 // 4]:.0f} dB): skipped to {self.probe_pos // 1000}s")
+
+    def tail_silent(self, left, vol):
+        """The last seconds of a song are often silence: do not sit through them."""
+        mono = time.monotonic()
+        if left > 25000 or mono - self.started < 6:
+            return False
+        lv = full_scale(self.meter.since(mono - 3), vol)
+        return len(lv) >= 10 and max(lv) < self.cfg["intro_db"] - 15
+
+    def follow(self, now, mood):
         """Returns how long to sleep. Starts the next song when this one is about to end, when
         you ask for another one, or when Spotify moved on to a song of its own."""
         item = now.get("item") or {}
         uri = item.get("uri")
+        mono = time.monotonic()
         if self.skip:
             self.hands_off = False
-            self.play_next()
+            self.next_song(mood)
             return 1.0
         if self.hands_off or not uri:
+            self.back = False
             return 1.0
         if uri != self.current:
+            if mono < self.pending:
+                return 0.3                          # our own song is still loading
             ctx = (now.get("context") or {}).get("uri", "")
             if ctx and not ctx.startswith("spotify:track:") and ctx != uri:
                 self.hands_off = True               # you started a playlist / album yourself
-                log("something else was started by hand: left alone until the situation changes")
+                log("something else was started by hand: left alone until `wow-music next`")
             else:
-                self.play_next()                    # Spotify's own follow-up song: replace it
+                self.next_song(mood)                # Spotify's own follow-up song: replace it
             return 1.0
-        try:
-            pos = now["position"]
-            left = item["decorations"]["playback"]["duration_ms"] - pos["position_ms"] \
-                - (time.time() * 1000 - pos["timestamp_ms"])
-        except (KeyError, TypeError):
+        pos, left = self.position(now)
+        vol = now.get("volume") if isinstance(now.get("volume"), (int, float)) else 0
+        if self.back:
+            self.back = False
+            if pos > 8000 or len(self.played) < 2:
+                ctl("seek", str(self.lib["tracks"].get(uri, {}).get("lead", 0)))
+                self.started = mono
+            else:
+                self.played.pop()
+                self.play(self.played.pop())
             return 1.0
-        if left < 1300:
-            self.play_next()
+        if self.probing and vol > 5:
+            self.probe(pos, left, vol)
+        if left < 1300 or (vol > 5 and not self.probing and self.tail_silent(left, vol)):
+            self.next_song(mood)
             return 1.0
         return 0.4 if left < 6000 else 1.0
 
@@ -1175,41 +1431,57 @@ def write_smart(text):
 
 
 def daemon(cfg):
-    import signal
+    import atexit, signal
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))   # so a fade's `finally` runs
     signal.signal(signal.SIGUSR1, lambda *_: setattr(dj, "skip", True))     # wow-music next
-    lib = load_library()
-    dj = DJ(cfg, lib)
-    if not any(dj.by_mood.values()):
+    signal.signal(signal.SIGUSR2, lambda *_: setattr(dj, "back", True))     # wow-music prev
+    meter = Meter()
+    dj = DJ(cfg, load_library(), meter)
+    if not dj.has_songs():
         log("no scanned songs (wow-music scan)"); return 1
+    atexit.register(meter.close)
+    meter.start()
     game, tail = Game(cfg), LogTail()
     for line in tail.lines():                       # catch up: where are we right now
         game.feed(line)
     game.last_fight = game.last_pvp = float("-inf")
     game.fight_start, game.boss = None, False
+    game.fights.clear()
     shown = None
+    hold = cfg["battle_hold"]
     while True:
         for line in tail.lines():
             game.feed(line)
         if not soloist_on():
             time.sleep(3)
             continue
-        sit, urgent = game.situation(time.time())
+        wall = time.time()
+        sit, level = game.situation(wall)           # level: 0 place, 1 battle, 2 boss
         mood = cfg["moods"].get(sit, "calm")
+        busy = not level and game.busy(wall) >= cfg["busy_share"]
+        if busy:                                    # lots of fighting lately: one step livelier
+            mood = MOODS[min(len(MOODS) - 1, MOODS.index(mood) + 1)] if mood in MOODS else mood
         now = soloist_now()
         playing = soloist_playing(now)
-        text = f"{sit} ({game.zone or 'no zone yet'}) -> {mood}" + ("" if playing else " · paused")
+        text = (f"{sit}{', fighting a lot' if busy else ''} ({game.zone or 'no zone yet'}) -> "
+                f"{'now' if level else 'next song'}: {mood}" + ("" if playing else " · paused"))
         if text != shown:
             shown = text
             write_smart(text)
         nap = 1.0
-        if playing:                                 # paused by you = stays paused
-            if dj.mood is None:
-                dj.switch(mood, sit)
-            elif mood != dj.mood and (urgent or time.monotonic() - dj.switched >= cfg["min_dwell"]):
-                dj.switch(mood, sit, urgent)
-            else:
-                nap = dj.follow(now)
+        mono = time.monotonic()
+        if not playing:                             # paused by you = stays paused
+            dj.started = mono                       # (and its silence is not an intro)
+        elif dj.current is None:
+            dj.begin(now, mood)
+        elif level and not dj.battle and not dj.hands_off \
+                and (level == 2 or mono - dj.switched >= hold):
+            dj.interrupt(now, mood, sit, level == 2)
+        elif not level and dj.battle and mono - dj.switched >= hold:
+            dj.settle(mood, sit)
+        else:
+            nap = dj.follow(now, dj.mood if dj.battle else mood)
+            meter.check()
         time.sleep(nap)
 
 
@@ -1295,7 +1567,11 @@ def main():
                     run("systemctl", "--user", "stop", SMART_UNIT, timeout=20)
                     SMART_STATUS.unlink(missing_ok=True)
                     if args[1] == "random" and to_uri(cfg["playlist"]):
-                        ctl("shuffle", "on"); ctl("play", to_uri(cfg["playlist"])); ctl("next")
+                        vol = find(soloist_now(), "volume") or cfg["volume"] or 70
+                        ctl("volume", "0")          # the playlist's first song is not heard
+                        ctl("shuffle", "on"); ctl("play", to_uri(cfg["playlist"]))
+                        time.sleep(1.5); ctl("next"); time.sleep(0.8)
+                        ctl("volume", str(int(vol)))
         log(f"mode: {cfg['mode']}")
         return 0
     if cmd == "pair":
