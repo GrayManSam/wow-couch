@@ -522,6 +522,9 @@ local function helpText()
         KEY .. "Hold Share + right stick left|r  previous track",
         KEY .. "Hold Share + right stick up / down|r  music volume",
         KEY .. "Tap Share|r  play / pause",
+        DIM .. "Smart mode picks the songs: calm while exploring,|r",
+        DIM .. "steady in dungeons, intense for bosses / PvP / long fights.|r",
+        DIM .. "Skip = another song of the same kind.|r",
         " ",
         HEAD .. "DISCORD VOICE|r",
         KEY .. "Hold Share 1 s, let go|r  join / leave voice",
@@ -684,7 +687,9 @@ f:SetScript("OnEvent", function()
     -- Combat log feeds the Govee lights (govee-wow), which only run on the TV (couch):
     -- logged only there, so desk play doesn't fill Logs/. /couch lights off to stop.
     if LoggingCombat then
-        local want = CouchUIDB.combatLog ~= false and profileName() == "Couch"
+        -- (2.5) logged in both profiles: the smart mode of wow-music reads it too (which
+        -- songs fit what is happening). /couch lights off stops it.
+        local want = CouchUIDB.combatLog ~= false
         if want ~= (LoggingCombat() and true or false) then pcall(LoggingCombat, want) end
     end
     hookMacroTips()
@@ -715,7 +720,7 @@ SlashCmdList.COUCHUI = function(input)
     elseif cmd == "lights" then
         CouchUIDB.combatLog = (arg ~= "off")
         pcall(LoggingCombat, CouchUIDB.combatLog)
-        say("Govee light sync (combat log) " .. (CouchUIDB.combatLog and "on" or "off"))
+        say("Combat log for light sync + smart music " .. (CouchUIDB.combatLog and "on" or "off"))
     elseif cmd == "binds" then if arg == "undo" then undoBinds() else applyBinds() end
     elseif cmd == "social" then
         if arg == "off" then removeSocial()

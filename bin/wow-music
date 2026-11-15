@@ -12,6 +12,16 @@
   wow-music playlist [URL|URI]     show / set what `start` plays (playlist, album, artist)
   wow-music pair        one-time: connect the headless player to your Spotify account
   wow-music update      download the current Soloist build (they expire after 90 days)
+  wow-music mode [smart|random]    smart = the music follows the game (headless player only):
+                        calm songs while exploring / in town, steady in dungeons and raids,
+                        intense for bosses, PvP and long fights. random = plain shuffle.
+  wow-music scan        listen to the playlist's song previews and sort them by intensity
+                        (needed once for smart mode, again after you add songs)
+  wow-music moods [calm|steady|intense]   how the songs were sorted
+  wow-music tag calm|steady|intense       re-sort the song playing right now (remembered)
+  wow-music quality [lossless|very_high|high]   streaming quality of the headless player
+  wow-music eq [on|off]   TV speaker EQ for the music (own clean path: the game's compressor
+                        never touches the music). Bands: "eq_bands" in the config.
   wow-music on | off    start with WoW or not (default on). While on, `battlenet --wow` also
                         switches the game's own music off (Sound_EnableMusic 0); off = back on.
 
@@ -24,7 +34,10 @@ driven with `soloist ctl`). API key: ~/.config/wow-music/soloist.env (0600). One
 build is 60 days old). Not paired / broken / "player": "app" in the config -> the Spotify
 desktop app is launched minimized instead (MPRIS over busctl, volume via its PipeWire stream).
 A desktop app that is already playing is left alone. Stdlib only.
-Config: ~/.config/wow-music/config.json
+Smart mode reads the game's combat log (WoW/Logs/WoWCombatLog*.txt, CouchUI turns logging
+on), so it reacts a few seconds after the game does; song changes fade. Songs come from the
+playlist itself: add songs to the playlist in Spotify, run `wow-music scan`.
+Config: ~/.config/wow-music/config.json   Song library: ~/.config/wow-music/library.json
 """
 import json
 import os
@@ -43,6 +56,33 @@ DEFAULTS = {
     "enabled": True,
     "step": 5,            # volume step in percent
     "volume": None,       # percent applied to Spotify's stream at start (None = leave)
+    "mode": "smart",      # smart (needs a scanned library + the headless player) or random
+    "moods": {            # game situation -> kind of song
+        "world": "calm", "city": "calm", "dungeon": "steady", "raid": "steady",
+        "combat": "intense", "boss": "intense", "pvp": "intense",
+    },
+    "zones": {            # zone name (part of it) -> situation, checked before the automatics
+        "Orgrimmar": "city", "Stormwind": "city", "Ironforge": "city", "Thunder Bluff": "city",
+        "Undercity": "city", "Darnassus": "city", "Silvermoon": "city", "Exodar": "city",
+        "Shattrath": "city", "Dalaran": "city",
+        "Warsong Gulch": "pvp", "Arathi Basin": "pvp", "Alterac Valley": "pvp",
+        "Eye of the Storm": "pvp", "Arena": "pvp",
+    },
+    "combat_after": 8,    # seconds a fight must last before the music turns intense
+    "calm_after": 15,     # seconds without fighting before it settles again
+    "min_dwell": 25,      # at least this long between two mood changes (bosses ignore it)
+    "quality": "lossless",  # lossless (FLAC, up to 24-bit/44.1 kHz) | very_high (320) | high (160)
+    "eq": True,           # music through its own TV-speaker EQ while the TV is the output
+    "eq_preamp": -4.0,    # dB, keeps the boosts below from clipping
+    "eq_bands": [         # type (highpass|lowshelf|peaking|highshelf), Hz, Q, gain dB
+        ["highpass", 45, 0.71, 0],     # nothing the TV speakers can play: saves headroom
+        ["lowshelf", 110, 0.7, 3.0],   # body the small drivers lack
+        ["peaking", 300, 1.0, -2.5],   # boxiness of a thin TV cabinet
+        ["peaking", 650, 1.4, -1.0],
+        ["peaking", 2800, 0.9, 1.5],   # clarity (down-firing speakers)
+        ["peaking", 7000, 2.5, -1.0],  # harshness
+        ["highshelf", 11000, 0.7, 2.0],  # air
+    ],
     "player": "auto",     # auto = Soloist (headless) when paired, else the desktop app; "app"
 }
 BUS = "org.mpris.MediaPlayer2.spotify"
@@ -321,6 +361,7 @@ def soloist_start(cfg, uri, session):
     session.update(player="soloist", launched=not unit_active())
     SESSION.write_text(json.dumps(session))
     if session["launched"]:
+        ensure_quality(cfg)
         log("starting Soloist")
         run("systemctl", "--user", "start", UNIT, timeout=20)
     deadline = time.monotonic() + 20
@@ -350,6 +391,13 @@ def soloist_start(cfg, uri, session):
     session["started"] = True
     SESSION.write_text(json.dumps(session))
     log(f"playing {uri} (headless): {soloist_track()}")
+    if eq_route(cfg):
+        log("sound: music through the TV EQ (its own path, no game compressor)")
+    if smart_wanted(cfg):
+        run("systemctl", "--user", "restart", SMART_UNIT, timeout=20)
+        log("smart mode: the music follows the game")
+    elif cfg["mode"] == "smart":
+        log("smart mode needs a song library: wow-music scan (random for now)")
     return True
 
 
@@ -372,6 +420,140 @@ def pair():
         time.sleep(2)
     log("not paired yet (run wow-music pair again)")
     return 1
+
+
+# ---- sound quality: lossless stream, TV-speaker EQ on its own path ---------------------
+QUALITY = {"high": 3, "very_high": 4, "lossless": 5}
+EQ_UNIT = "wow-music-eq.service"
+EQ_CONF = CONF / "eq.conf"
+EQ_SINK = "wow_music_eq"
+
+
+def ensure_quality(cfg):
+    """Soloist has no quality switch; it reads the same preference the desktop app writes
+    (audio.play_bitrate_enumeration: 3 high, 4 very high, 5 lossless). Without it: 160 kbps.
+    Written while Soloist is stopped; returns True if the file changed."""
+    want = QUALITY.get(cfg["quality"], 5)
+    changed = False
+    for d in (Path.home() / ".local/share/soloist/settings/Users").glob("*-user"):
+        f = d / "prefs"
+        try:
+            lines = f.read_text().splitlines()
+        except OSError:
+            lines = []
+        keep = [ln for ln in lines if not ln.startswith(("audio.play_bitrate_enumeration=",
+                                                         "audio.play_bitrate_non_metered_enumeration="))]
+        new = keep + [f"audio.play_bitrate_enumeration={want}",
+                      f"audio.play_bitrate_non_metered_enumeration={want}"]
+        if new != lines:
+            f.write_text("\n".join(new) + "\n")
+            changed = True
+    return changed
+
+
+def eq_conf(cfg):
+    nodes, links, prev = [], [], None
+    bands = [["highshelf", 0, 1.0, cfg["eq_preamp"]]] + list(cfg["eq_bands"])
+    for i, (kind, freq, q, gain) in enumerate(bands):
+        name = f"b{i}"
+        nodes.append(f'{{ type = builtin name = {name} label = bq_{kind} '
+                     f'control = {{ "Freq" = {float(freq)} "Q" = {float(q)} "Gain" = {float(gain)} }} }}')
+        if prev:
+            links.append(f'{{ output = "{prev}:Out" input = "{name}:In" }}')
+        prev = name
+    nl = "\n                    "
+    return f"""# written by wow-music - TV-speaker EQ for the music, on its own sink; regenerated on start
+context.properties = {{ log.level = 1 }}
+context.spa-libs = {{
+    audio.convert.* = audioconvert/libspa-audioconvert
+    support.*       = support/libspa-support
+}}
+context.modules = [
+    {{ name = libpipewire-module-rt args = {{ nice.level = -11 }} flags = [ ifexists nofail ] }}
+    {{ name = libpipewire-module-protocol-native }}
+    {{ name = libpipewire-module-client-node }}
+    {{ name = libpipewire-module-adapter }}
+    {{ name = libpipewire-module-filter-chain
+        args = {{
+            node.description = "Music (TV EQ)"
+            media.name = "Music (TV EQ)"
+            filter.graph = {{
+                nodes = [
+                    {nl.join(nodes)}
+                ]
+                links = [
+                    {nl.join(links)}
+                ]
+            }}
+            audio.channels = 2
+            audio.position = [ FL FR ]
+            capture.props = {{ node.name = "{EQ_SINK}" media.class = "Audio/Sink" }}
+            playback.props = {{ node.name = "{EQ_SINK}_out" node.passive = true
+                               application.name = "wow-music-eq" resample.quality = 12 }}
+        }}
+    }}
+]
+"""
+
+
+def tv_is_output():
+    sink = run("pactl", "get-default-sink")[1].lower()
+    return "hdmi" in sink or "xbox_tv_headset" in sink
+
+
+def eq_sink_up():
+    return any(ln.split("\t")[1:2] == [EQ_SINK]
+               for ln in run("pactl", "list", "sinks", "short")[1].splitlines())
+
+
+def route():
+    """Put the music back on its own path: player -> EQ sink -> the real output. EasyEffects
+    grabs every stream when it starts (its blocklist only keeps them out afterwards), so
+    `audio wow start|route` call this once EasyEffects is up."""
+    if not eq_sink_up():
+        return False
+    out = run("pactl", "get-default-sink")[1]
+    rc, raw = run("pactl", "-f", "json", "list", "sink-inputs")
+    sinks = {ln.split("\t")[0]: ln.split("\t")[1]
+             for ln in run("pactl", "list", "sinks", "short")[1].splitlines() if "\t" in ln}
+    try:
+        items = json.loads(raw) if not rc else []
+    except ValueError:
+        items = []
+    moved = 0
+    for it in items:
+        props = it.get("properties", {})
+        app, on = props.get("application.name", ""), sinks.get(str(it.get("sink")), "")
+        if app == "wow-music-eq" or props.get("node.name") == EQ_SINK + "_out":
+            if out and out not in (EQ_SINK, "easyeffects_sink") and on != out:
+                moved += run("pactl", "move-sink-input", str(it["index"]), out)[0] == 0
+        elif any(k in app.lower() for k in ("spotify", "librespot")) and on != EQ_SINK:
+            moved += run("pactl", "move-sink-input", str(it["index"]), EQ_SINK)[0] == 0
+    return moved
+
+
+def eq_route(cfg, wait=12):
+    """Music -> EQ sink -> TV while the TV is the output; plain default output otherwise."""
+    want = cfg["eq"] and tv_is_output()
+    if not want:
+        run("systemctl", "--user", "stop", EQ_UNIT, timeout=20)
+        return False
+    text = eq_conf(cfg)
+    try:
+        same = EQ_CONF.read_text() == text
+    except OSError:
+        same = False
+    if not same:
+        EQ_CONF.write_text(text)
+    run("systemctl", "--user", "restart" if not same else "start", EQ_UNIT, timeout=20)
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        ss = streams()
+        if eq_sink_up() and ss:
+            route()
+            return True
+        time.sleep(0.5)
+    return False
 
 
 # ---- session ------------------------------------------------------------------------
@@ -465,6 +647,9 @@ def stop():
         log("no session: nothing to stop")
         return 0
     SESSION.unlink(missing_ok=True)
+    run("systemctl", "--user", "stop", SMART_UNIT, timeout=20)
+    SMART_STATUS.unlink(missing_ok=True)
+    run("systemctl", "--user", "stop", EQ_UNIT, timeout=20)
     if session.get("player") == "soloist":
         if session.get("launched"):
             run("systemctl", "--user", "stop", UNIT, timeout=20)
@@ -500,6 +685,15 @@ def status(cfg):
         log(f"headless player: installed, build {age} days old (expires at 90)"
             + ("" if SOLOIST_ENV.exists() else "  - NO API KEY")
             + ("" if not unit_active() or soloist_paired() else "  - NOT PAIRED (wow-music pair)"))
+    try:
+        smart = SMART_STATUS.read_text().strip()
+    except OSError:
+        smart = None
+    n = len(load_library().get("tracks", {}))
+    log(f"quality: {cfg['quality']}   TV EQ: {'on' if cfg['eq'] else 'off'}"
+        + (" (active)" if eq_sink_up() else ""))
+    log(f"mode: {cfg['mode']}" + (f"   now: {smart}" if smart else "")
+        + (f"   library: {n} songs" if n else "   library: none (wow-music scan)"))
     log(f"with WoW: {'on' if cfg['enabled'] else 'off'}   playlist: {cfg['playlist']}   "
         f"shuffle: {'on' if cfg['shuffle'] else 'off'}")
     return 0
@@ -509,7 +703,14 @@ def control(cmd):
     if soloist_on():
         if cmd == "toggle":
             cmd = "pause" if soloist_playing() else "play"
-        ctl(cmd)
+        smart = run("systemctl", "--user", "is-active", "--quiet", SMART_UNIT)[0] == 0
+        if cmd == "next" and smart:                 # smart mode: another song of this mood
+            run("systemctl", "--user", "kill", "-s", "USR1", SMART_UNIT)
+            time.sleep(1.6)
+        elif cmd == "prev" and smart:
+            ctl("seek", "0")                        # no song history in smart mode: restart it
+        else:
+            ctl(cmd)
         time.sleep(0.5)
         now = soloist_now()
         log(f"{'Playing' if soloist_playing(now) else 'Paused'}: {soloist_track(now)}")
@@ -523,6 +724,499 @@ def control(cmd):
     time.sleep(0.4)
     log(f"{prop('PlaybackStatus')}: {track()}")
     return 0
+
+
+# ---- smart mode: song library --------------------------------------------------------
+LIBRARY = CONF / "library.json"
+SMART_UNIT = "wow-music-smart.service"
+SMART_STATUS = SESSION.with_name("wow-music.smart")
+MOODS = ("calm", "steady", "intense")
+WOW_DIR = Path(os.environ.get("WOW_DIR") or Path.home() /
+               "Games/battlenet/drive_c/Program Files (x86)/World of Warcraft/_forever_")
+LOG_DIR = Path(os.environ.get("WOW_MUSIC_LOGS") or WOW_DIR / "Logs")     # env: tests
+
+
+def load_library():
+    try:
+        return json.loads(LIBRARY.read_text())
+    except (OSError, ValueError):
+        return {"tracks": {}}
+
+
+def save_library(lib):
+    CONF.mkdir(parents=True, exist_ok=True)
+    LIBRARY.write_text(json.dumps(lib, indent=1, ensure_ascii=False) + "\n")
+
+
+def fetch(url, binary=False):
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = r.read()
+    return data if binary else data.decode("utf-8", "replace")
+
+
+def playlist_tracks(uri):
+    """Songs of a playlist/album from Spotify's public embed page (title, artist, 30 s preview).
+    The page lists the first 100 songs."""
+    kind, ident = uri.split(":")[1:3]
+    html = fetch(f"https://open.spotify.com/embed/{kind}/{ident}")
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+    if not m:
+        return []
+
+    def walk(o):
+        if isinstance(o, dict):
+            if isinstance(o.get("trackList"), list):
+                return o["trackList"]
+            o = list(o.values())
+        if isinstance(o, list):
+            for v in o:
+                r = walk(v)
+                if r:
+                    return r
+        return None
+    out = []
+    for t in walk(json.loads(m.group(1))) or []:
+        if t.get("uri", "").startswith("spotify:track:") and t.get("isPlayable", True):
+            out.append({"uri": t["uri"], "title": t.get("title", "?"),
+                        "artist": t.get("subtitle", "?").replace("\u00a0", " "),
+                        "preview": (t.get("audioPreview") or {}).get("url")})
+    return out
+
+
+def track_preview(uri):
+    """Preview URL of one song, from its public embed page."""
+    html = fetch(f"https://open.spotify.com/embed/track/{uri.split(':')[2]}")
+    m = re.search(r'"audioPreview":\{[^}]*"url":"([^"]+)"', html)
+    return m.group(1) if m else None
+
+
+def entry_info(e):
+    item = e.get("item", e)
+    try:
+        dec = item["decorations"]
+        return {"uri": item["uri"], "title": dec["identity"]["name"], "preview": None,
+                "artist": ", ".join(c["entity"]["decorations"]["identity"]["name"]
+                                    for c in dec.get("creators", [])) or "?"}
+    except (KeyError, TypeError):
+        return None
+
+
+def playlist_walk(uri, on_context):
+    """Every song of the playlist, read from the headless player: its queue shows the next 80
+    songs, and each reshuffle shows 80 different ones. Reshuffled until nothing new turns up
+    (about a minute for 600 songs). Nothing is skipped and the playing song is not touched.
+    (Skipping through the playlist instead gets the skip button rate-limited by Spotify.)"""
+    found, stale, rounds = {}, 0, 0
+    if not on_context:
+        ctl("play", uri)
+        time.sleep(2.5)
+    while stale < 4 and rounds < 60:
+        rounds += 1
+        ctl("shuffle", "off"); time.sleep(0.7)
+        ctl("shuffle", "on"); time.sleep(1.3)
+        try:
+            q = json.loads(ctl("queue", "2000", "--json")[1])
+        except ValueError:
+            q = {}
+        before = len(found)
+        for e in [soloist_now()] + list(q.get("upcoming", [])):
+            if e.get("source", "context") != "context":
+                continue
+            info = entry_info(e)
+            if info and info["uri"].startswith("spotify:track:"):
+                found.setdefault(info["uri"], info)
+        stale = stale + 1 if len(found) == before else 0
+        if sys.stdout.isatty():
+            print(f"\r reading the playlist: {len(found)} songs", end="", flush=True)
+    if sys.stdout.isatty():
+        print()
+    return list(found.values())
+
+
+def analyze(mp3):
+    """30 s preview -> (loudness, punch, brightness): how loud, how percussive, how bright."""
+    import array, math
+    try:
+        r = subprocess.run(["ffmpeg", "-v", "error", "-i", "pipe:0", "-ac", "1", "-ar", "11025",
+                            "-f", "s16le", "pipe:1"], input=mp3, capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    pcm = array.array("h")
+    pcm.frombytes(r.stdout[:len(r.stdout) // 2 * 2])
+    n = 256
+    if len(pcm) < n * 40:
+        return None
+    env, crossings = [], 0
+    for i in range(0, len(pcm) - n, n):
+        frame = pcm[i:i + n]
+        env.append(math.sqrt(sum(x * x for x in frame) / n) + 1.0)
+        crossings += sum(1 for a, b in zip(frame, frame[1:]) if (a < 0) != (b < 0))
+    db = [20 * math.log10(e) for e in env]
+    loud = sum(db) / len(db)
+    punch = sum(max(0.0, b - a) for a, b in zip(db, db[1:])) / len(db)
+    return loud, punch, crossings / len(pcm)
+
+
+def sort_moods(lib):
+    """Rank the songs against each other: lowest 40 % calm, next 30 % steady, top 30 % intense.
+    A song you tagged yourself keeps its tag."""
+    tracks = [t for t in lib["tracks"].values() if t.get("features")]
+    if not tracks:
+        return
+    for i, weight in enumerate((0.5, 0.35, 0.15)):
+        order = sorted(tracks, key=lambda t: t["features"][i])
+        for rank, t in enumerate(order):
+            t["energy"] = (t.get("energy", 0.0) if i else 0.0) + weight * rank / max(1, len(order) - 1)
+    for t in tracks:
+        t["energy"] = round(t["energy"], 3)
+        t["mood"] = t.get("tag") or ("calm" if t["energy"] < 0.4 else
+                                     "steady" if t["energy"] < 0.65 else "intense")
+
+
+def scan(cfg):
+    uri = to_uri(cfg["playlist"])
+    if not uri:
+        log("no playlist yet: wow-music playlist <spotify link>"); return 1
+    try:
+        found = playlist_tracks(uri)
+    except Exception as e:                           # network / page layout
+        log(f"could not read the playlist page: {e}")
+        found = []
+    walked = False
+    if (len(found) >= 90 or not found) and soloist_on() and uri.startswith("spotify:playlist:"):
+        was_smart = run("systemctl", "--user", "is-active", "--quiet", SMART_UNIT)[0] == 0
+        if was_smart:
+            run("systemctl", "--user", "stop", SMART_UNIT, timeout=20)
+        on_context = (soloist_now().get("context") or {}).get("uri") == uri
+        try:
+            have = {t["uri"] for t in found}
+            for t in playlist_walk(uri, on_context):
+                if t["uri"] not in have:
+                    found.append(t)
+            walked = True
+        finally:
+            ctl("shuffle", "on" if cfg["shuffle"] else "off")
+            if was_smart:
+                run("systemctl", "--user", "start", SMART_UNIT, timeout=20)
+    if not found:
+        log("no songs found"); return 1
+    lib = load_library()
+    old = lib.get("tracks", {}) if lib.get("playlist") == uri else {}
+    tracks, new, failed = {}, 0, 0
+    todo = []
+    for t in found:
+        entry = old.get(t["uri"], {})
+        entry.update(title=t["title"], artist=t["artist"])
+        tracks[t["uri"]] = entry
+        if not entry.get("features"):
+            todo.append(t)
+
+    def listen(t):
+        try:
+            url = t["preview"] or track_preview(t["uri"])
+            return t["uri"], (analyze(fetch(url, binary=True)) if url else None)
+        except Exception:
+            return t["uri"], None
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for i, (u, feats) in enumerate(pool.map(listen, todo), 1):
+            if feats:
+                tracks[u]["features"] = [round(f, 4) for f in feats]
+                new += 1
+            else:
+                failed += 1
+            if sys.stdout.isatty():
+                print(f"\r listening to previews {i}/{len(todo)}", end="", flush=True)
+    if sys.stdout.isatty():
+        print()
+    lib = {"playlist": uri, "scanned": time.strftime("%F %T"), "tracks": tracks}
+    sort_moods(lib)
+    save_library(lib)
+    counts = {m: sum(1 for t in tracks.values() if t.get("mood") == m) for m in MOODS}
+    log(f"{len(tracks)} songs ({new} newly analysed, {failed} without a preview): "
+        + ", ".join(f"{counts[m]} {m}" for m in MOODS))
+    if len(found) >= 90 and not walked:
+        log("note: without the headless player running only the first 100 songs can be read "
+            "(wow-music start, then wow-music scan)")
+    return 0
+
+
+def moods(which=None):
+    lib = load_library()
+    if not lib["tracks"]:
+        log("no library yet: wow-music scan"); return 1
+    for m in MOODS:
+        ts = sorted((t for t in lib["tracks"].values() if t.get("mood") == m),
+                    key=lambda t: t.get("energy", 0))
+        log(f"{m}: {len(ts)} songs")
+        if which == m or which == "all":
+            for t in ts:
+                log(f"   {t.get('energy', 0):.2f}{' *' if t.get('tag') else '  '} "
+                    f"{t['artist'].split(',')[0]} - {t['title']}")
+    if not which:
+        log("wow-music moods calm|steady|intense|all lists the songs (* = tagged by you)")
+    return 0
+
+
+def tag(mood):
+    if mood not in MOODS:
+        log("wow-music tag calm|steady|intense"); return 1
+    now = soloist_now() if soloist_on() else {}
+    uri = (now.get("item") or {}).get("uri")
+    if not uri:
+        log("nothing is playing on the headless player"); return 1
+    lib = load_library()
+    t = lib["tracks"].setdefault(uri, {"title": soloist_track(now), "artist": ""})
+    t["tag"] = t["mood"] = mood
+    save_library(lib)
+    log(f"{soloist_track(now)} -> {mood}"); notify(f"Tagged {mood}")
+    return 0
+
+
+# ---- smart mode: what is happening in the game ---------------------------------------
+F_MINE, F_HOSTILE, F_PLAYER, F_PET, F_GUARDIAN = 0x1, 0x40, 0x400, 0x1000, 0x2000
+DAMAGE = ("SWING_DAMAGE", "RANGE_DAMAGE", "SPELL_DAMAGE", "SPELL_PERIODIC_DAMAGE")
+RAID_DIFFICULTIES = {3, 4, 5, 6, 7, 9, 14, 15, 16, 17, 33, 148, 175, 176, 185, 186, 193, 194}
+
+
+def log_time(stamp):
+    """'11/13/2026 23:17:42.142-5' -> epoch seconds (the game writes local time)."""
+    try:
+        d, t = stamp.split(" ")[:2]
+        t = t.split("-")[0].split("+")[0]
+        hms, ms = (t.split(".") + ["0"])[:2]
+        return time.mktime(time.strptime(f"{d} {hms}", "%m/%d/%Y %H:%M:%S")) + int(ms) / 10 ** len(ms)
+    except (ValueError, IndexError):
+        return None
+
+
+def flags(v):
+    try:
+        return int(v, 16)
+    except ValueError:
+        return 0
+
+
+class Game:
+    """Game situation from combat log lines: place, boss, fighting, PvP."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.place = "world"            # world / city / dungeon / raid / pvp
+        self.zone = ""
+        self.boss = False
+        self.fight_start = None         # game time the current fight began
+        self.last_fight = float("-inf")
+        self.last_pvp = float("-inf")
+        self.clock = 0.0                # newest game time seen
+
+    def feed(self, line):
+        parts = line.split("  ", 1)
+        if len(parts) != 2:
+            return
+        ts = log_time(parts[0])
+        if ts is None:
+            return
+        self.clock = max(self.clock, ts)
+        f = parts[1].strip().split(",")
+        ev = f[0]
+        if ev == "ZONE_CHANGE" and len(f) > 3:
+            self.zone = f[2].strip('"')
+            try:
+                diff = int(f[3])
+            except ValueError:
+                diff = 0
+            self.place = "raid" if diff in RAID_DIFFICULTIES else "dungeon" if diff else "world"
+            for name, place in self.cfg["zones"].items():
+                if name.lower() in self.zone.lower():
+                    self.place = place
+            self.boss = False
+        elif ev == "ENCOUNTER_START":
+            self.boss = True
+        elif ev == "ENCOUNTER_END":
+            self.boss = False
+        elif ev == "ARENA_MATCH_START":
+            self.place = "pvp"
+        elif ev in DAMAGE and len(f) > 7:
+            sfl, dfl = flags(f[3]), flags(f[7])
+            mine = F_PLAYER | F_PET | F_GUARDIAN
+            out = sfl & F_MINE and sfl & mine and dfl & F_HOSTILE
+            taken = dfl & F_MINE and dfl & mine and sfl & F_HOSTILE
+            if out or taken:
+                if ts - self.last_fight > self.cfg["calm_after"]:
+                    self.fight_start = ts
+                self.last_fight = ts
+                if (dfl if out else sfl) & F_PLAYER:
+                    self.last_pvp = ts
+
+    def situation(self, now):
+        """(situation, urgent). `now` = wall clock; the log's own times decide what is recent."""
+        quiet = now - self.last_fight
+        if self.boss:
+            return "boss", True
+        if now - self.last_pvp < 30:
+            return "pvp", False
+        if quiet < self.cfg["calm_after"] and self.fight_start is not None \
+                and self.last_fight - self.fight_start >= self.cfg["combat_after"]:
+            return "combat", False
+        return self.place, False
+
+
+class LogTail:
+    """Follows the newest WoWCombatLog*.txt (the game starts a new file every session)."""
+
+    def __init__(self):
+        self.path, self.pos, self.rest = None, 0, b""
+
+    def lines(self):
+        try:
+            newest = max(LOG_DIR.glob("WoWCombatLog*.txt"), key=lambda p: p.stat().st_mtime)
+        except (ValueError, OSError):
+            return []
+        if newest != self.path:
+            self.path, self.pos, self.rest = newest, 0, b""
+        try:
+            with open(self.path, "rb") as fh:
+                fh.seek(self.pos)
+                data = fh.read()
+                self.pos = fh.tell()
+        except OSError:
+            return []
+        *done, self.rest = (self.rest + data).split(b"\n")
+        return [ln.decode("utf-8", "replace") for ln in done]
+
+
+# ---- smart mode: the DJ -------------------------------------------------------------
+class DJ:
+    """Keeps a song of the wanted mood playing on Soloist. Each song is started by itself and
+    the next one is started just before it ends. (Spotify's queue is not used: it cannot be
+    cleared, so songs queued for a fight would still play after it.)"""
+
+    def __init__(self, cfg, lib):
+        import random
+        self.cfg, self.rng = cfg, random.Random()
+        self.by_mood = {m: [u for u, t in lib["tracks"].items() if t.get("mood") == m]
+                        for m in MOODS}
+        self.recent = []
+        self.mood = None
+        self.current = None
+        self.skip = False               # `wow-music next` asked for another song
+        self.hands_off = False          # you picked something else: left alone until the next change
+        self.switched = float("-inf")
+
+    def pick(self, mood):
+        pool = self.by_mood.get(mood) or [u for m in MOODS for u in self.by_mood[m]]
+        fresh = [u for u in pool if u not in self.recent] or pool
+        uri = self.rng.choice(fresh)
+        self.recent = (self.recent + [uri])[-max(1, min(20, len(pool) // 2)):]
+        return uri
+
+    def fade(self, lo, hi, steps, pause):
+        for i in range(1, steps + 1):
+            ctl("volume", str(round(lo + (hi - lo) * i / steps)))
+            time.sleep(pause)
+
+    def switch(self, mood, why, urgent=False):
+        vol = find(soloist_now(), "volume")
+        vol = int(vol) if isinstance(vol, (int, float)) and vol > 5 else (self.cfg["volume"] or 70)
+        first = self.pick(mood)
+        log(f"{why}: {self.mood or 'start'} -> {mood}")
+        try:
+            self.fade(vol, vol * 0.25, 2 if urgent else 5, 0.12 if urgent else 0.3)
+            ctl("shuffle", "off")
+            ctl("play", first)
+            self.current = first
+            self.fade(vol * 0.25, vol, 3, 0.15)
+        finally:
+            ctl("volume", str(vol))                 # also when stopped in the middle of a fade
+        self.mood, self.hands_off, self.switched = mood, False, time.monotonic()
+
+    def play_next(self):
+        self.current = self.pick(self.mood)
+        ctl("play", self.current)
+        self.skip = False
+
+    def follow(self, now):
+        """Returns how long to sleep. Starts the next song when this one is about to end, when
+        you ask for another one, or when Spotify moved on to a song of its own."""
+        item = now.get("item") or {}
+        uri = item.get("uri")
+        if self.skip:
+            self.hands_off = False
+            self.play_next()
+            return 1.0
+        if self.hands_off or not uri:
+            return 1.0
+        if uri != self.current:
+            ctx = (now.get("context") or {}).get("uri", "")
+            if ctx and not ctx.startswith("spotify:track:") and ctx != uri:
+                self.hands_off = True               # you started a playlist / album yourself
+                log("something else was started by hand: left alone until the situation changes")
+            else:
+                self.play_next()                    # Spotify's own follow-up song: replace it
+            return 1.0
+        try:
+            pos = now["position"]
+            left = item["decorations"]["playback"]["duration_ms"] - pos["position_ms"] \
+                - (time.time() * 1000 - pos["timestamp_ms"])
+        except (KeyError, TypeError):
+            return 1.0
+        if left < 1300:
+            self.play_next()
+            return 1.0
+        return 0.4 if left < 6000 else 1.0
+
+
+def write_smart(text):
+    try:
+        SMART_STATUS.write_text(text + "\n")
+    except OSError:
+        pass
+
+
+def daemon(cfg):
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))   # so a fade's `finally` runs
+    signal.signal(signal.SIGUSR1, lambda *_: setattr(dj, "skip", True))     # wow-music next
+    lib = load_library()
+    dj = DJ(cfg, lib)
+    if not any(dj.by_mood.values()):
+        log("no scanned songs (wow-music scan)"); return 1
+    game, tail = Game(cfg), LogTail()
+    for line in tail.lines():                       # catch up: where are we right now
+        game.feed(line)
+    game.last_fight = game.last_pvp = float("-inf")
+    game.fight_start, game.boss = None, False
+    shown = None
+    while True:
+        for line in tail.lines():
+            game.feed(line)
+        if not soloist_on():
+            time.sleep(3)
+            continue
+        sit, urgent = game.situation(time.time())
+        mood = cfg["moods"].get(sit, "calm")
+        now = soloist_now()
+        playing = soloist_playing(now)
+        text = f"{sit} ({game.zone or 'no zone yet'}) -> {mood}" + ("" if playing else " · paused")
+        if text != shown:
+            shown = text
+            write_smart(text)
+        nap = 1.0
+        if playing:                                 # paused by you = stays paused
+            if dj.mood is None:
+                dj.switch(mood, sit)
+            elif mood != dj.mood and (urgent or time.monotonic() - dj.switched >= cfg["min_dwell"]):
+                dj.switch(mood, sit, urgent)
+            else:
+                nap = dj.follow(now)
+        time.sleep(nap)
+
+
+def smart_wanted(cfg):
+    return cfg["mode"] == "smart" and bool(load_library().get("tracks"))
 
 
 def main():
@@ -549,6 +1243,62 @@ def main():
             cfg["playlist"] = uri
             save(cfg)
         log(cfg["playlist"])
+        return 0
+    if cmd == "route":
+        n = route()
+        log("music path: " + ("no TV EQ running" if n is False else f"{n} stream(s) put back"
+                              if n else "ok"))
+        return 0
+    if cmd == "quality":
+        if len(args) > 1:
+            if args[1] not in QUALITY:
+                log("wow-music quality lossless|very_high|high"); return 1
+            cfg["quality"] = args[1]
+            save(cfg)
+            was = unit_active()
+            if was:
+                run("systemctl", "--user", "stop", UNIT, timeout=20)
+            ensure_quality(cfg)
+            if was:
+                log("restart the music to apply: wow-music start --force")
+        log(f"quality: {cfg['quality']}")
+        return 0
+    if cmd == "eq":
+        if len(args) > 1:
+            cfg["eq"] = args[1] == "on"
+            save(cfg)
+            if soloist_on():
+                eq_route(cfg)
+                if not cfg["eq"]:
+                    for idx, _ in streams():
+                        run("pactl", "move-sink-input", idx, "@DEFAULT_SINK@")
+        log(f"eq: {'on' if cfg['eq'] else 'off'}"
+            + ("" if tv_is_output() else "  (only used while the TV is the output)"))
+        return 0
+    if cmd == "scan":
+        rc = scan(cfg)
+        return rc
+    if cmd == "moods":
+        return moods(args[1] if len(args) > 1 else None)
+    if cmd == "tag":
+        return tag(args[1] if len(args) > 1 else "")
+    if cmd == "daemon":
+        return daemon(cfg)
+    if cmd == "mode":
+        if len(args) > 1:
+            if args[1] not in ("smart", "random"):
+                log("wow-music mode smart|random"); return 1
+            cfg["mode"] = args[1]
+            save(cfg)
+            if soloist_on():
+                if args[1] == "smart" and smart_wanted(cfg):
+                    run("systemctl", "--user", "restart", SMART_UNIT, timeout=20)
+                else:
+                    run("systemctl", "--user", "stop", SMART_UNIT, timeout=20)
+                    SMART_STATUS.unlink(missing_ok=True)
+                    if args[1] == "random" and to_uri(cfg["playlist"]):
+                        ctl("shuffle", "on"); ctl("play", to_uri(cfg["playlist"])); ctl("next")
+        log(f"mode: {cfg['mode']}")
         return 0
     if cmd == "pair":
         return pair()

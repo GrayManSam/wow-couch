@@ -28,7 +28,9 @@ cp -r gnome-extension/pad-osk@local "$EXT/"
 gnome-extensions enable pad-osk@local 2>/dev/null || echo "enable pad-osk@local after logging back in"
 
 mkdir -p "$HOME/.config/systemd/user"
-cp systemd/padmode.service systemd/couchmode.service systemd/xbox-headset.service systemd/soloist.service "$HOME/.config/systemd/user/"
+cp systemd/padmode.service systemd/couchmode.service systemd/xbox-headset.service systemd/soloist.service systemd/wow-music-smart.service systemd/wow-music-eq.service "$HOME/.config/systemd/user/"
+mkdir -p "$HOME/.config/pipewire/client.conf.d"
+cp -n pipewire/client-10-quality.conf "$HOME/.config/pipewire/client.conf.d/10-quality.conf" || true
 mkdir -p "$HOME/.config/autostart"
 sed "s|@HOME@|$HOME|" autostart/discord-overlay.desktop > "$HOME/.config/autostart/discord-overlay.desktop"
 if [[ "$WOW_DIR" != "$DEFAULT_WOW" ]]; then

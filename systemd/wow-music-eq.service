@@ -1,0 +1,8 @@
+[Unit]
+Description=wow-music TV EQ - the music's own sink in front of the TV (started by wow-music)
+After=pipewire.service
+
+[Service]
+ExecStart=/usr/bin/pipewire -c %h/.config/wow-music/eq.conf
+Restart=on-failure
+RestartSec=3

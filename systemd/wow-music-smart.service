@@ -1,0 +1,9 @@
+[Unit]
+Description=wow-music smart mode - the music follows the game (started by wow-music)
+PartOf=soloist.service
+
+[Service]
+ExecStart=%h/.local/bin/wow-music daemon
+Restart=on-failure
+RestartSec=5
+Nice=10

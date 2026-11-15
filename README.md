@@ -74,6 +74,24 @@ That alone works with the Spotify desktop app. For the headless player (Spotify 
 
 Open-source players (spotifyd, librespot...) no longer work: Spotify refuses them audio keys.
 
+**Smart mode** (default once scanned; headless player only): `wow-music scan` reads the whole
+playlist, listens to each song's 30 s preview and sorts the songs into calm / steady / intense
+by loudness and punch. While you play, the music follows the game through the combat log
+(CouchUI turns logging on): calm while exploring or in a city, steady in dungeons and raids,
+intense for boss fights, PvP and fights longer than 8 s; changes fade and are at least 25 s
+apart (bosses switch at once). `wow-music moods all` shows the sorting, `wow-music tag
+calm|steady|intense` re-sorts the song that is playing, `wow-music mode random` is plain
+shuffle. Situations, zones and timings are in `~/.config/wow-music/config.json`.
+
+**Sound quality.** Soloist streams 160 kbps unless told otherwise and has no switch for it;
+`wow-music` writes the preference the desktop app uses, so it plays **lossless** (FLAC,
+`wow-music quality lossless|very_high|high`). On the TV the music goes through its own sink
+with a TV-speaker EQ (`wow-music eq on|off`, bands in the config) straight to the TV: the
+game's EasyEffects chain (EQ + compressor) never touches it. Add `Spotify` and `wow-music-eq`
+to the blocklist of your EasyEffects game presets; `audio wow start|route` put the music back
+on its path after EasyEffects starts. `pipewire/client-10-quality.conf` raises the resampler
+quality for the 44.1 -> 48 kHz conversion.
+
 ## Use
 
 ```

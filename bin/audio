@@ -156,12 +156,14 @@ cur_preset() {
 # Move every app stream that is not already on the EasyEffects sink (and is not EE's own
 # or combine_sink's internal stream) to $1. EasyEffects then pulls them into its chain.
 move_streams() {
-  local ee_idx
+  local ee_idx mq_idx
   ee_idx=$(pactl list sinks short | awk -v s=$EE_SINK '$2==s {print $1}')
-  for id in $(pactl list sink-inputs 2>/dev/null | awk -v ee="$ee_idx" '
+  # wow-music's own path (music -> "Music (TV EQ)" sink -> TV): left exactly where it is
+  mq_idx=$(pactl list sinks short | awk '$2=="wow_music_eq" {print $1}')
+  for id in $(pactl list sink-inputs 2>/dev/null | awk -v ee="$ee_idx" -v mq="$mq_idx" '
     /^Sink Input #/ {id=substr($3,2); ids[++n]=id}
-    /^\tSink: / {if ($2==ee) skip[id]=1}
-    /node\.name|application\.(name|id)/ && tolower($0) ~ /easyeffects|output\.(combine_sink|xbox_tv_headset)/ {skip[id]=1}
+    /^\tSink: / {if ($2==ee || (mq!="" && $2==mq)) skip[id]=1}
+    /node\.name|application\.(name|id)/ && tolower($0) ~ /easyeffects|wow_music_eq|wow-music-eq|output\.(combine_sink|xbox_tv_headset)/ {skip[id]=1}
     END {for(i=1;i<=n;i++) if(!skip[ids[i]]) print ids[i]}'); do
     run pactl move-sink-input "$id" "$1"
   done
@@ -222,6 +224,8 @@ wow_start() {
   else
     echo "  EasyEffects did not start — sound on TV without EQ"
   fi
+  # EasyEffects pulls every stream in when it starts; the music has its own path (wow-music)
+  [ $DRY = 0 ] && [ -x "$HOME/.local/bin/wow-music" ] && { sleep 1.5; "$HOME/.local/bin/wow-music" route >/dev/null 2>&1; }
   echo "  TV sink: unmuted, volume ${TV_VOL}%"
   return 0
 }
@@ -572,6 +576,7 @@ wow_route() {
     [ "$sink" != "$target" ] && run pactl move-sink-input "$id" "$target"
     echo "  stream #$id ($app): ${sink} -> $target, volume ${v}% -> 100%, muted $mute -> no"
   done
+  [ $DRY = 0 ] && [ -x "$HOME/.local/bin/wow-music" ] && "$HOME/.local/bin/wow-music" route >/dev/null 2>&1
   return 0
 }
 
