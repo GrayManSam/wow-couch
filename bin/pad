@@ -217,7 +217,10 @@ def find_controller():
             keybits = (ev / "device/capabilities/key").read_text().split()
             absbits = int((ev / "device/capabilities/abs").read_text().split()[-1], 16)
             vendor = (ev / "device/id/vendor").read_text().strip().lower()
-            real = "/devices/virtual/" not in str((ev / "device").resolve())
+            # Steam Input / uinput pads live under /devices/virtual/input; a Bluetooth LE
+            # controller is "virtual" too (/devices/virtual/misc/uhid/...) but is the real pad.
+            where = str((ev / "device").resolve())
+            real = "/devices/virtual/" not in where or "/uhid/" in where
         except (OSError, ValueError):
             continue
         # must be a gamepad (BTN_SOUTH = 0x130 = word 4, bit 48) with a left stick
@@ -369,7 +372,18 @@ class Daemon:
     def active(self):
         return self.enabled and self.game is None and self.pad is not None
 
+    def sync_osk(self):
+        """On-screen keyboard pops up by itself when a text field is clicked, but only while
+        the controller drives the desktop (GNOME does this whenever its screen-keyboard
+        accessibility switch is on; with a real keyboard in use it would just be in the way)."""
+        want = bool(self.active)
+        if want != getattr(self, "osk_auto", None):
+            self.osk_auto = want
+            sh("gsettings", "set", "org.gnome.desktop.a11y.applications",
+               "screen-keyboard-enabled", "true" if want else "false")
+
     def set_status(self):
+        self.sync_osk()
         if self.pad is None:
             s = "waiting for controller"
         elif not self.enabled:

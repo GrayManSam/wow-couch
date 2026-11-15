@@ -190,6 +190,32 @@ tidy_up() {
   log "e. minimized $n Battle.net window(s), focused WoW window $wow"
 }
 
+# On a cold start Battle.net only SELECTS the game for --exec="launch WoWF" (its log: "Selecting
+# game family by id", no LaunchBinary) and waits for a click on Play. The same command sent
+# to the running, logged-in client does launch. So: wait until its log shows it is ready, then
+# send it again (a second Battle.net.exe in the same prefix hands the command over and exits).
+BNET_LOGS="$WINEPREFIX/drive_c/users/steamuser/AppData/Local/Battle.net/Logs"
+BNET_EXE="$WINEPREFIX/drive_c/Program Files (x86)/Battle.net/Battle.net.exe"
+auto_play() {
+  local l="" i try
+  for i in {1..150}; do
+    wow_running && return 0
+    l=$(ls -t "$BNET_LOGS"/battle.net-*.log 2>/dev/null | head -n1)
+    [[ -n "$l" && "$l" -nt "$SESSION" ]] && grep -aq 'Selecting game family by id' "$l" && break
+    sleep 1
+  done
+  for try in 1 2 3; do
+    sleep 4
+    wow_running && return 0
+    grep -aq 'LaunchBinary' "$l" 2>/dev/null && return 0
+    [[ -e "$SESSION" ]] || return 0
+    log "d. Battle.net is ready but did not start WoW: sending the launch command again (try $try)"
+    PROTON_VERB=runinprefix timeout 45 "$HOME/.local/bin/umu-run" "$BNET_EXE" --exec="launch WoWF" >/dev/null 2>&1 &
+    sleep 14
+  done
+  wow_running || log "d. WoW still not started after 3 tries (press Play)"
+}
+
 watchdog() {
   local mode="$1" child="$2" start=$SECONDS seen=0 idle=0
   local wow_seen=0 wow_since=0 wow_win="" tidy_until=0 exit_logged=0 hung=0
@@ -308,6 +334,7 @@ fi
 log "d. launching Battle.net $*"
 gamemoderun "$HOME/.local/bin/umu-run" "$LAUNCHER" "$@" &
 child=$!
+[[ "$mode" == wow ]] && ( auto_play ) &
 watchdog "$mode" "$child"
 wait "$child" 2>/dev/null
 log "=== launcher exit"
