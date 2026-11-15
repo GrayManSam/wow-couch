@@ -651,12 +651,10 @@ def stop():
     SMART_STATUS.unlink(missing_ok=True)
     run("systemctl", "--user", "stop", EQ_UNIT, timeout=20)
     if session.get("player") == "soloist":
-        if session.get("launched"):
-            run("systemctl", "--user", "stop", UNIT, timeout=20)
-            log("Soloist stopped")
-        elif session.get("started"):
-            ctl("pause")
-            log("paused")
+        # Soloist only exists for WoW sessions: always shut it down, also when it was
+        # already running before the session (it would sit there paused otherwise).
+        run("systemctl", "--user", "stop", UNIT, timeout=20)
+        log("Soloist stopped")
     elif session.get("launched"):
         run("busctl", "--user", "call", BUS, OBJ, "org.mpris.MediaPlayer2", "Quit")
         log("Spotify closed")
