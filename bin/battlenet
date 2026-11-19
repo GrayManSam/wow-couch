@@ -137,6 +137,15 @@ window_visible() {
 
 wow_running() { pgrep -f '^[A-Za-z]:.*Wow\.exe' >/dev/null; }
 
+# Another `battlenet --wow` is still starting or running WoW (its pid is in $SESSION).
+# Battle.net can take ~2 min before any window shows: a second click must not kill that.
+# (2026-11-18: a click on the Battle.net shortcut 10 s after WoW Forever stopped the session.)
+launch_in_progress() {
+  local pid
+  pid=$(cat "$SESSION" 2>/dev/null) || return 1
+  [[ -n "$pid" && "$pid" != "$$" ]] && kill -0 "$pid" 2>/dev/null
+}
+
 # Exit Game can leave Wow.exe hung after the client has shut down (seen 2026-11-14: Client.log
 # "Client Destroy", window gone, process alive 20+ min - kept the pad paused and the lights on).
 # Hung = the game window no longer exists (a minimized window still does) AND Client.log's
@@ -187,7 +196,9 @@ tidy_up() {
     xdotool windowminimize "$w" 2>/dev/null && n=$((n + 1))
   done
   xdotool windowactivate "$wow" 2>/dev/null
-  log "e. minimized $n Battle.net window(s), focused WoW window $wow"
+  # WoW's "maximized" window sits under the GNOME top bar (wrong size/aspect): make it truly fullscreen
+  xdotool windowstate --add FULLSCREEN "$wow" 2>/dev/null
+  log "e. minimized $n Battle.net window(s), focused + fullscreened WoW window $wow ($(xdotool getwindowgeometry "$wow" 2>/dev/null | awk '/Geometry/{print $2}'))"
 }
 
 # On a cold start Battle.net only SELECTS the game for --exec="launch WoWF" (its log: "Selecting
@@ -200,6 +211,7 @@ auto_play() {
   local l="" i try
   for i in {1..150}; do
     wow_running && return 0
+    [[ "$(cat "$SESSION" 2>/dev/null)" == "$$" ]] || return 0
     l=$(ls -t "$BNET_LOGS"/battle.net-*.log 2>/dev/null | head -n1)
     [[ -n "$l" && "$l" -nt "$SESSION" ]] && grep -aq 'Selecting game family by id' "$l" && break
     sleep 1
@@ -208,7 +220,7 @@ auto_play() {
     sleep 4
     wow_running && return 0
     grep -aq 'LaunchBinary' "$l" 2>/dev/null && return 0
-    [[ -e "$SESSION" ]] || return 0
+    [[ "$(cat "$SESSION" 2>/dev/null)" == "$$" ]] || return 0
     log "d. Battle.net is ready but did not start WoW: sending the launch command again (try $try)"
     PROTON_VERB=runinprefix timeout 45 "$HOME/.local/bin/umu-run" "$BNET_EXE" --exec="launch WoWF" >/dev/null 2>&1 &
     sleep 14
@@ -280,10 +292,30 @@ case "$1" in
     shift; mode=wow
     if [[ "$1" == "--dry-run" ]]; then DRY=1; shift; fi
     log "=== battlenet --wow$( (( DRY )) && echo ' --dry-run')"
-    if wow_running; then log "WoW already running, nothing to do"; notify "WoW is already running."; exit 0; fi
+    if launch_in_progress && ! wow_running; then
+      log "WoW launch already in progress (pid $(cat "$SESSION")): nothing to do"
+      notify "World of Warcraft is still starting - Battle.net can take a couple of minutes."; exit 0
+    fi
+    # Just pressed Exit Game? Wow.exe can outlive its window for a few seconds (or hang until
+    # the watchdog ends it): wait for it to go, then launch, instead of "already running".
+    if wow_running && [[ -z "$(wow_window 1)" ]] && (( ! DRY )); then
+      log "Wow.exe still closing: waiting up to 30 s"
+      for _ in {1..30}; do wow_running || break; sleep 1; done
+      if wow_running; then pkill -TERM -f '^[A-Za-z]:.*Wow\.exe'; sleep 3; fi
+      launch_in_progress && for _ in {1..20}; do launch_in_progress || break; sleep 1; done
+    fi
+    if wow_running; then
+      w=$(wow_window 1); [[ -n "$w" ]] && xdotool windowactivate "$w" 2>/dev/null
+      log "WoW already running, nothing to do"; notify "WoW is already running."; exit 0
+    fi
+    (( DRY )) || notify "Starting World of Warcraft... Battle.net can take a couple of minutes."
     if pgrep -f 'Battle\.net\.exe' >/dev/null; then log "Battle.net already running: restarting session"; stop_session; fi
     set -- --exec="launch WoWF" "$@" ;;   # game family ID is case-sensitive: "wowf" silently falls back to W3
   *)
+    if launch_in_progress; then
+      log "=== battlenet (launcher): WoW launch in progress (pid $(cat "$SESSION")), left alone"
+      notify "World of Warcraft is starting - Battle.net can take a couple of minutes."; exit 0
+    fi
     if pgrep -f 'Battle\.net\.exe' >/dev/null; then
       if window_visible || wow_running; then notify "Battle.net is already open."; exit 0; fi
       stop_session   # stale, invisible session left behind: clear it and relaunch
@@ -293,12 +325,15 @@ esac
 
 if [[ "$mode" == wow ]]; then
   dry=(); (( DRY )) && dry=(--dry-run)
+  # Spotify with WoW only in the couch (TV) profile; at the desk Spotify stays the user's own.
+  profile=$(cat "$HOME/.config/gameprofile/current" 2>/dev/null || echo desk)
+  music=0; [[ "$profile" == couch && -x "$MUSIC" ]] && "$MUSIC" enabled && music=1
   (( DRY )) || echo "$$" >"$SESSION"
   trap 'log "signal received"; wow_teardown signal; exit 0' TERM INT HUP
   # a. couch profile: graphics CVars + which UI addons load
   if (( DRY )); then log "a. would run: couch wow-prep"
   elif [[ -x "$COUCH" ]]; then
-    spotify=0; [[ -x "$MUSIC" ]] && "$MUSIC" enabled && spotify=1   # Spotify on -> game music off
+    spotify=$music   # Spotify on -> game music off; desk keeps the game's own music
     hook "a. couch wow-prep (spotify=$spotify)" 20 env WOW_SPOTIFY="$spotify" "$COUCH" wow-prep
   else log "a. couch: not installed, skipped"; fi
   # b. display: TV only while WoW runs (before Wine starts, so Wine never sees a re-layout)
@@ -311,7 +346,8 @@ if [[ "$mode" == wow ]]; then
     hook "c. audio wow start" 20 "$AUDIO" wow start "${dry[@]}"
   else log "c. audio wow: not available, skipped"; fi
   # Spotify in the background (slow when it has to launch: never delays the game)
-  if [[ -x "$MUSIC" ]]; then
+  if (( ! music )); then log "c. wow-music: skipped ($profile profile)"
+  elif [[ -x "$MUSIC" ]]; then
     if (( DRY )); then hook "c. wow-music start" 20 "$MUSIC" start --dry-run
     else ( hook "c. wow-music start" 100 "$MUSIC" start ) & fi
   fi

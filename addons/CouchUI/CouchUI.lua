@@ -12,6 +12,8 @@
 -- /couch arrange      move minimap/chat/damage meter/quests out of the way (undo: /couch arrange undo)
 -- /couch macros       (re)create the macros and put them on the bar buttons + wheels
 -- /couch macros undo  bar buttons and wheels back to the plain spells
+-- /couch mode         controller / keyboard mode: [controller|desk|auto], [profiles on|off]
+-- /couch desk         desk: which key has each controller button / wheel macro ([reset] = place again)
 -- /couch help         controller map: every button, wheel, macro, music + voice shortcut
 --                     (also: "Controls" on the Social wheel). Any button closes it.
 
@@ -28,12 +30,83 @@ local MACROS = {
 
 local function say(msg) DEFAULT_CHAT_FRAME:AddMessage("|cff69ccf0CouchUI|r " .. msg) end
 
+-- ---- Reload prompt (2.20) -----------------------------------------------------------
+-- Forever blocks ReloadUI() from addon code (ADDON_ACTION_BLOCKED): it has to come from a
+-- click or a key press. So every reload CouchUI needs is a small prompt: click Reload now,
+-- or A on the controller (B = not now). onYes runs first (in the same press).
+local prompt
+local function askReload(text, onYes, onNo, opts)
+    if InCombatLockdown() then return say(text .. " - after this fight: /reload") end
+    if not prompt then
+        prompt = CreateFrame("Frame", "CouchUIReloadPrompt", UIParent, "BackdropTemplate")
+        prompt:SetSize(460, 118)
+        prompt:SetPoint("TOP", 0, -140)
+        prompt:SetFrameStrata("DIALOG")
+        prompt:SetBackdrop({ bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background-Dark",
+            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border", tile = true, tileSize = 32,
+            edgeSize = 24, insets = { left = 6, right = 6, top = 6, bottom = 6 } })
+        prompt.text = prompt:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+        prompt.text:SetPoint("TOP", 0, -18)
+        prompt.text:SetWidth(420)
+        local yes = CreateFrame("Button", "CouchUIReloadYes", prompt, "UIPanelButtonTemplate")
+        yes:SetSize(170, 26); yes:SetPoint("BOTTOMLEFT", 30, 16)
+        yes:SetText("Reload now  (A)")
+        yes:SetScript("OnClick", function()
+            local f, noReload = prompt.onYes, prompt.noReload
+            prompt.onYes, prompt.onNo = nil, nil
+            if noReload then prompt:Hide() end
+            if f then pcall(f) end
+            if not noReload then ReloadUI() end
+        end)
+        local no = CreateFrame("Button", "CouchUIReloadNo", prompt, "UIPanelButtonTemplate")
+        no:SetSize(170, 26); no:SetPoint("BOTTOMRIGHT", -30, 16)
+        no:SetText("Not now  (B)")
+        no:SetScript("OnClick", function()
+            local f = prompt.onNo
+            prompt.onYes, prompt.onNo = nil, nil
+            prompt:Hide()
+            if f then pcall(f) end
+        end)
+        prompt:SetScript("OnShow", function(self)
+            ClearOverrideBindings(self)
+            -- (2.22) controller A / B only: Enter / Esc stay the game's (an Enter meant for chat
+            -- answered the talent prompt)
+            SetOverrideBindingClick(self, true, "PAD1", "CouchUIReloadYes")
+            SetOverrideBindingClick(self, true, "PAD2", "CouchUIReloadNo")
+        end)
+        prompt:SetScript("OnHide", function(self) if not InCombatLockdown() then ClearOverrideBindings(self) end end)
+        prompt:RegisterEvent("PLAYER_REGEN_DISABLED")          -- a fight starts: get out of the way
+        prompt:SetScript("OnEvent", function(self) self:Hide() end)
+        prompt:Hide()
+    end
+    opts = opts or {}
+    if prompt:IsShown() and prompt.noReload ~= (opts.noReload or nil) then
+        if opts.noReload then return end          -- a reload question is up: talents wait
+    end
+    CouchUIReloadYes:SetText(opts.yes or "Reload now  (A)")
+    prompt.noReload = opts.noReload
+    -- several reasons at once (profiles + layout): one prompt, every onYes runs
+    if prompt:IsShown() and prompt.onYes and onYes and not opts.noReload then
+        local a, b = prompt.onYes, onYes
+        onYes = function() pcall(a); b() end
+    elseif prompt:IsShown() and prompt.onYes and not onYes then
+        onYes = prompt.onYes
+    end
+    prompt.text:SetText("|cff69ccf0CouchUI|r\n" .. text)
+    prompt.onYes, prompt.onNo = onYes, onNo
+    prompt:Show()
+end
+
 local function isLoaded(name)
     if C_AddOns and C_AddOns.IsAddOnLoaded then return C_AddOns.IsAddOnLoaded(name) end
     return IsAddOnLoaded and IsAddOnLoaded(name)
 end
 
 local function profileName() return isLoaded("EasyController") and "Couch" or "Desk" end
+local function isPadKey(key) return key:find("PAD") ~= nil end
+
+BINDING_HEADER_COUCHUI = "CouchUI"
+_G["BINDING_NAME_COUCHUI_TOGGLEMODE"] = "Toggle controller / keyboard mode"
 
 local function prof()
     local p = profileName()
@@ -73,7 +146,11 @@ local function applyLayout(name)
         end
         if not idx then
             local src
-            if info.activeLayout > presets then
+            -- (2.18) Desk starts from the game's own "Modern" preset, not a copy of the TV
+            -- layout (that one is anchored to the gamepad bar and sized for the couch)
+            if name == "Desk" and presets > 0 then
+                src = EditModePresetLayoutManager:GetCopyOfPresetLayouts()[1]
+            elseif info.activeLayout > presets then
                 src = info.layouts[info.activeLayout - presets]
             elseif presets > 0 then
                 src = EditModePresetLayoutManager:GetCopyOfPresetLayouts()[info.activeLayout]
@@ -179,9 +256,8 @@ local function arrange(name, undo)
             CouchUIDB.arranged[name] = ARRANGE_VERSION
         end
         C_EditMode.SaveLayouts(info)
-        say((undo and "layout restored" or "minimap, chat, damage meter, quests rearranged") ..
-            " - reloading UI in 2 s...")
-        C_Timer.After(2, ReloadUI)
+        askReload((undo and "Layout restored" or "Minimap, chat, damage meter and quests moved") ..
+            " - reload to see it.")
     end)
     if not ok then say("arrange failed: " .. tostring(err)) end
 end
@@ -224,15 +300,25 @@ end
 
 local function applyBinds()
     if InCombatLockdown() then return say("leave combat first") end
-    local backup = {}
-    for key, action in pairs(deskBindTable()) do
-        backup[key] = GetBindingAction(key) or ""
+    local backup, want = {}, deskBindTable()
+    want["CTRL-SHIFT-M"] = "COUCHUI_TOGGLEMODE"
+    want["CTRL-I"] = "MACRO Recruit"
+    local actions = {}
+    for key, action in pairs(want) do actions[action] = true end
+    for action in pairs(actions) do               -- old keys of these actions (7 8 9 0 - =)
+        local keys = { GetBindingKey(action) }
+        for _, k in ipairs(keys) do
+            if not want[k] and not isPadKey(k) then backup[k] = action; SetBinding(k) end
+        end
+    end
+    for key, action in pairs(want) do
+        backup[key] = backup[key] or GetBindingAction(key) or ""
         SetBinding(key, action)
     end
     CouchUIDB.bindBackup = CouchUIDB.bindBackup or backup
     SaveBindings(GetCurrentBindingSet())
     CouchUIDB.bindsApplied = true
-    say("desk keybinds set: 1-6 QERFTG, Shift/Ctrl bars, mouse 4/5 + ZXCV, ` pet attack. /couch binds undo to restore.")
+    say("desk keybinds set: 1-6 QERFTG, Shift/Ctrl bars, mouse 4/5 + ZXCV, ` pet attack, Ctrl-Shift-M controller/keyboard mode. /couch binds undo to restore.")
 end
 
 local function undoBinds()
@@ -264,9 +350,13 @@ local bagItem   -- defined below: the item of a kind in the bags (or the last on
 local HUNTER = {
     -- From the combat log (62% of the damage dealt in melee, 15 "target too close"): one
     -- button for both ranges. Up close Raptor Strike lands, at range Arcane Shot + Auto Shot.
-    { "Fight", "Raptor Strike",
-        "#showtooltip\n/startattack\n/cast Raptor Strike\n/cast Arcane Shot\n/cast !Auto Shot",
-        { button = true, old = { "#showtooltip\n/startattack\n/cast Raptor Strike\n/cast Arcane Shot\n/cast !Auto Shot\n/run UIErrorsFrame:Clear()" }, help = "One button for any range: Raptor Strike up close, Arcane + Auto Shot from afar" } },
+    -- (2.21, Feor's Forever leveling guide) Summon Hawk replaces Arcane Shot once talented
+    { "Fight", "Raptor Strike", "",
+        { button = true, build = function()
+              return "#showtooltip\n/startattack\n/cast Raptor Strike\n" ..
+                  (spellExists("Summon Hawk") and "/cast Summon Hawk\n" or "") ..
+                  "/cast Arcane Shot\n/cast !Auto Shot"
+          end, old = { "#showtooltip\n/startattack\n/cast Raptor Strike\n/cast Arcane Shot\n/cast !Auto Shot\n/run UIErrorsFrame:Clear()" }, help = "One button for any range: Raptor Strike up close, Arcane + Auto Shot from afar" } },
     -- From the combat log (5 deaths, 1 potion): everything that heals, on one button
     { "Panic", nil, "",
         { button = true, quiet = true, help = "Emergency: Infusion of Wind + your healing potion",
@@ -325,8 +415,9 @@ local HUNTER = {
     { "Cooldowns", "Rapid Fire",
         "#showtooltip Rapid Fire\n/cast Rapid Fire\n/cast Elune's Light\n/cast Blood Fury\n/cast Berserking\n/cast Bestial Wrath\n/use 13",
         { swap = { "Rapid Fire" }, help = "Rapid Fire + racial + Bestial Wrath + first trinket" } },
-    { "Scatter", "Scatter Shot", "#showtooltip Scatter Shot\n/petpassive\n/petfollow\n/cast " .. MO .. "Scatter Shot",
-        { swap = { "Scatter Shot" }, help = "Pet back (so it doesn't break it), then Scatter Shot" } },
+    { "Scatter", "Scatter Shot", "#showtooltip Scatter Shot\n/stopattack\n/stopcasting\n/petpassive\n/petfollow\n/cast " .. MO .. "Scatter Shot\n/stopattack",
+        { swap = { "Scatter Shot" }, old = { "#showtooltip Scatter Shot\n/petpassive\n/petfollow\n/cast " .. MO .. "Scatter Shot" },
+          help = "Stop Auto Shot + pet back (neither breaks it), then Scatter Shot" } },
     { "Tranq", "Tranquilizing Shot",
         "#showtooltip Tranquilizing Shot\n/cast [@mouseover,harm,nodead][@focus,harm,nodead][] Tranquilizing Shot",
         { swap = { "Tranquilizing Shot" }, help = "Tranquilizing Shot on mouseover, else focus, else target" } },
@@ -340,7 +431,7 @@ local HUNTER = {
         { swap = { "Scare Beast" }, help = "Scare Beast on mouseover, else target" } },
     { "EagleEye", "Eagle Eye", "#showtooltip Eagle Eye\n/cast !Eagle Eye",
         { swap = { "Eagle Eye" }, help = "Eagle Eye, can be cast again while looking" } },
-    { "Flare", "Flare", "#showtooltip Flare\n/cast [@cursor] Flare",
+    { "Flare", "Flare", "#showtooltip Flare\n/cast [@cursor] !Flare",
         { swap = { "Flare" }, desk = true, help = "Flare at the mouse cursor" } },
     { "Volley", "Volley", "#showtooltip Volley\n/cast [@cursor] Volley",
         { swap = { "Volley" }, desk = true, help = "Volley at the mouse cursor" } },
@@ -1364,13 +1455,89 @@ local function recruitGo(test)
         (left > 1 and (" (" .. (left - 1) .. " more nearby)") or ""))
 end
 
+-- (2.23) How the PC learns "type /ginvite now": at the couch the CouchLights strip (govee-wow
+-- reads it from its screen capture); at the desk a 6 px magenta square in the top-left corner
+-- for 0.6 s, read by the wow-recruit service (a few pixels, no capture, no keyboard access).
+local beacon
+local function recruitSignal()
+    if isLoaded("EasyController") then
+        if _G.CouchLights_Recruit then pcall(_G.CouchLights_Recruit) end
+        return
+    end
+    if not beacon then
+        beacon = CreateFrame("Frame", "CouchUIRecruitBeacon", UIParent)
+        beacon:SetFrameStrata("TOOLTIP")
+        beacon:SetFrameLevel(9999)
+        beacon:SetPoint("TOPLEFT", UIParent, "TOPLEFT", 0, 0)
+        local t = beacon:CreateTexture(nil, "OVERLAY")
+        t:SetAllPoints()
+        t:SetColorTexture(1, 0, 1, 1)
+        beacon:Hide()
+    end
+    local px = 6 / (UIParent:GetEffectiveScale() or 1) / ((GetPhysicalScreenSize and select(2, GetPhysicalScreenSize()) or 768) / 768)
+    beacon:SetSize(math.max(px, 4), math.max(px, 4))
+    beacon:Show()
+    C_Timer.After(0.6, function() beacon:Hide() end)
+end
+
+-- the whisper that goes with the invite: {name} = their first name, {guild} = your guild
+local RECRUIT_MSG = "Hey {name}! I just sent you an invite to <{guild}> - a friendly, laid-back " ..
+    "guild: leveling together, dungeons, help with quests and questions anytime. No pressure, " ..
+    "decline if you're not looking. Welcome aboard if you join! :)"
+-- Sent only once the game confirms the invite ("You have invited X to join your guild"), so
+-- nobody is told about an invite that never went out.
+local whisperFor          -- { full = name with realm, first = first name, at = time() }
+local function recruitWhisper(unit)          -- arm: remember who, wait for the confirmation
+    if CouchUIDB.recruitMsg == false or not UnitIsPlayer(unit) then return end
+    local full = GetUnitName(unit, true)
+    if not full then return end
+    whisperFor = { full = full, first = (UnitName(unit) or full):match("^(%S+)") or full, at = time() }
+end
+-- (2.24) {guild} = a clickable Guild Finder link when the guild has a Guild Finder listing
+-- (click it: their game opens your guild's page), else the plain name.
+local function guildLink()
+    local name = GetGuildInfo("player")
+    if not name then return nil end
+    local ok, link = pcall(function()
+        local clubId = C_Club and C_Club.GetGuildClubId and C_Club.GetGuildClubId()
+        if not (clubId and C_ClubFinder and C_ClubFinder.GetRecruitingClubInfoFromClubID) then return end
+        local info = C_ClubFinder.GetRecruitingClubInfoFromClubID(clubId)
+        local guid = info and info.clubFinderGUID
+        if not guid or guid == "" then
+            if C_ClubFinder.RequestPostingInformationFromClubId then
+                C_ClubFinder.RequestPostingInformationFromClubId(clubId)   -- for next time
+            end
+            return
+        end
+        if GetClubFinderLink then return GetClubFinderLink(guid, name) end
+        return "|cffffd100|HclubFinder:" .. guid .. "|h[" .. (_G.CLUB_FINDER_LINK_GUILD or "Guild") ..
+            ": " .. name .. "]|h|r"
+    end)
+    return (ok and link) or nil, name
+end
+
+local function recruitWhisperConfirmed(invited)
+    local w = whisperFor
+    if not w or time() - w.at > 20 then return end
+    if invited and not (w.full == invited or w.full:find(invited, 1, true) or invited:find(w.first, 1, true)) then return end
+    whisperFor = nil
+    local link, guild = guildLink()
+    if not guild then return end
+    local text = (CouchUIDB.recruitMsg or RECRUIT_MSG)
+    if link then text = text:gsub("<{guild}>", "{guild}") end      -- the link has its own brackets
+    local msg = text:gsub("{name}", w.first):gsub("{guild}", function() return link or guild end)
+    local send = (C_ChatInfo and C_ChatInfo.SendChatMessage) or SendChatMessage
+    if not pcall(send, msg:sub(1, 255), "WHISPER", nil, w.full) then say("Recruit: couldn't whisper " .. w.full) end
+end
+
 local function recruitSent(n)
     n = shortName(n)
     if not n or n == "" then
         local _, left = recruitPick()
         if UnitIsPlayer("target") and not UnitIsUnit("target", "player") and not GetGuildInfo("target") then
             say("Recruit: inviting your target |cffffffff" .. (GetUnitName("target", true) or "?") .. "|r")
-            if _G.CouchLights_Recruit then pcall(_G.CouchLights_Recruit) end
+            recruitSignal()
+            recruitWhisper("target")
         elseif not UnitExists("target") and left == 0 then
             say("Recruit: nobody new nearby - walk past some players (or target one with LB)")
         elseif UnitIsPlayer("target") and GetGuildInfo("target") then
@@ -1384,7 +1551,8 @@ local function recruitSent(n)
         say("Recruit: " .. n .. " walked out of range - press again for the next one")
     else
         recruitDB().done[n] = time()
-        if _G.CouchLights_Recruit then pcall(_G.CouchLights_Recruit) end   -- PC types /ginvite
+        recruitSignal()                          -- the PC types /ginvite
+        recruitWhisper("target")
         local _, left = recruitPick()
         say("Recruit: inviting |cffffffff" .. n .. "|r" ..
             (left > 0 and (" (" .. left .. " more nearby)") or ""))
@@ -1472,7 +1640,9 @@ local function watchRecruit()
                     local n = p and a1:match(p)
                     if n then
                         n = shortName(n)
-                        if kind == "invited" then r.invited = r.invited + 1
+                        if kind == "invited" then
+                            r.invited = r.invited + 1
+                            recruitWhisperConfirmed(n)
                         elseif kind == "joined" then if r.done[n] then r.joined = r.joined + 1 end
                         elseif kind == "declined" then r.declined = r.declined + 1 end
                         if kind ~= "joined" then r.done[n] = r.done[n] or time() end
@@ -1699,6 +1869,476 @@ local function watchQuestItems()
     C_Timer.NewTicker(5, function() pcall(questItemUpdate, false) end)  -- walking to another quest
 end
 
+-- ---- Desk: everything the controller can do, on a key too (2.18) -------------------
+-- Easy Controller keeps its LT / RT / LT + RT buttons on the game's gamepad bar and the
+-- pet / utility macros on CouchWheels wheels - neither has a key. At the desk the macros
+-- (Fight, Panic, pet commands, quest item, mount) and every spell that is only on the
+-- gamepad bar go on the first EMPTY keyboard button that has a key: main bar (1-6 QERFTG),
+-- Shift bar, Ctrl bar, right bar (mouse 4/5, ZXCV). Nothing is moved or replaced; once
+-- placed, a button you take off stays off. /couch desk = where everything is,
+-- /couch desk reset = place everything again.
+local DESK_BARS = { { 1, "ACTIONBUTTON" }, { 61, "MULTIACTIONBAR1BUTTON" },
+                    { 49, "MULTIACTIONBAR2BUTTON" }, { 25, "MULTIACTIONBAR3BUTTON" } }
+local DESK_FIRST = { "Fight", "Panic" }        -- then the gamepad bar's spells, then these
+local DESK_LATER = { "PetAttack", "PetRecall", "PetSummon", "FeedPet", "QuestItem", "Mount", "Hearth" }
+
+local function deskSlots()                      -- { slot, key } with a key bound, in order
+    local list = {}
+    for _, bar in ipairs(DESK_BARS) do
+        for i = 1, 12 do
+            local key = GetBindingKey(bar[2] .. i)
+            if key then list[#list + 1] = { bar[1] + i - 1, key } end
+        end
+    end
+    return list
+end
+
+local function deskKeyText(key)
+    return (key:gsub("BUTTON4", "Mouse 4"):gsub("BUTTON5", "Mouse 5"):gsub("SHIFT%-", "Shift-")
+        :gsub("CTRL%-", "Ctrl-"):gsub("ALT%-", "Alt-"))
+end
+
+-- what a slot holds as a comparable key ("macro:Fight", "spell:Arcane Shot", "item:118")
+-- plus how to pick it up again
+local function slotThing(slot)
+    local ok, kind, id = pcall(GetActionInfo, slot)
+    if not ok then return nil end
+    if kind == "macro" then
+        local n = GetActionText(slot)
+        return n and ("macro:" .. n), { "macro", n }
+    elseif kind == "spell" and id then
+        local n = spellName(id)
+        return n and ("spell:" .. n), { "spell", id }
+    elseif kind == "item" and id then
+        return "item:" .. id, { "item", id }
+    end
+end
+
+local function pickUp(how)
+    ClearCursor()
+    if how[1] == "macro" then PickupMacro(how[2])
+    elseif how[1] == "spell" then pcall(C_Spell and C_Spell.PickupSpell or PickupSpell, how[2])
+    elseif how[1] == "item" then pcall(C_Item and C_Item.PickupItem or PickupItem, how[2]) end
+    return GetCursorInfo() ~= nil
+end
+
+local function deskDB()
+    CouchUIDB.desk = CouchUIDB.desk or {}
+    local key = UnitGUID("player") or "?"
+    CouchUIDB.desk[key] = CouchUIDB.desk[key] or { done = {} }
+    return CouchUIDB.desk[key]
+end
+
+local function deskPlace(verbose)
+    if InCombatLockdown() or isLoaded("EasyController") then return end
+    local db = deskDB()
+    local slots = deskSlots()
+    local onKey, free = {}, {}
+    for _, s in ipairs(slots) do
+        local k = slotThing(s[1])
+        if k then onKey[k] = onKey[k] or s[2] else free[#free + 1] = s end
+    end
+    -- a spell counts as on a key when the macro standing in for it is
+    local map = swapMap()
+    for spell, macro in pairs(map) do
+        if onKey["macro:" .. macro] then onKey["spell:" .. spell] = onKey["macro:" .. macro] end
+    end
+    local want, seen = {}, {}
+    local function addMacros(list)
+        for _, n in ipairs(list) do
+            if not seen["macro:" .. n] and GetMacroIndexByName(n) ~= 0 then
+                want[#want + 1] = { "macro:" .. n, { "macro", n } }; seen["macro:" .. n] = true
+            end
+        end
+    end
+    addMacros(DESK_FIRST)
+    for _, n in ipairs(DESK_LATER) do seen["macro:" .. n] = true end   -- placed after the spells
+    for slot = 73, 300 do                        -- the gamepad bars (and nothing visible)
+        local k, how = slotThing(slot)
+        if k and not seen[k] and not (how[1] == "macro" and how[2] == RECRUIT) then
+            seen[k] = true
+            local spell = how[1] == "spell" and k:sub(7)
+            local passive = spell and C_Spell and C_Spell.IsSpellPassive and
+                select(2, pcall(C_Spell.IsSpellPassive, how[2]))
+            if not passive then want[#want + 1] = { map[spell or ""] and ("macro:" .. map[spell]) or k,
+                map[spell or ""] and { "macro", map[spell] } or how } end
+        end
+    end
+    for _, n in ipairs(DESK_LATER) do seen["macro:" .. n] = nil end
+    addMacros(DESK_LATER)
+    local placed, left = {}, 0
+    for _, w in ipairs(want) do
+        local k, how = w[1], w[2]
+        if not onKey[k] and not db.done[k] then
+            local s = table.remove(free, 1)
+            if not s then left = left + 1
+            elseif pickUp(how) then
+                PlaceAction(s[1])
+                ClearCursor()
+                if slotThing(s[1]) == k then
+                    db.done[k] = true
+                    onKey[k] = s[2]
+                    placed[#placed + 1] = "|cffffd100" .. k:gsub("^%a+:", "") .. "|r " .. deskKeyText(s[2])
+                else
+                    table.insert(free, 1, s)
+                end
+            end
+        elseif onKey[k] then
+            db.done[k] = true
+        end
+    end
+    ClearCursor()
+    if #placed > 0 then say("desk keys: " .. table.concat(placed, ", ")) end
+    if left > 0 then say("|cffffaa00" .. left .. " more had no free keyboard button|r - /couch desk lists them") end
+    if verbose then
+        local all = {}
+        for _, w in ipairs(want) do
+            all[#all + 1] = w[1]:gsub("^%a+:", "") .. " " ..
+                (onKey[w[1]] and deskKeyText(onKey[w[1]]) or "|cff888888(no key)|r")
+        end
+        say("desk: " .. (#all > 0 and table.concat(all, ", ") or "nothing extra to place"))
+    end
+end
+
+-- ---- Talents: Feor's Forever BM leveling path, one prompt per point (2.21) ----------
+-- 31 Beast Mastery / 20 Marksmanship, in the guide's order (level 10 -> 60). Stored as tree
+-- name + row + column (as the talent window draws them), the game supplies the names. Each
+-- unspent point: a prompt "Learn <talent>?" (click or A = learn + apply, B = not now).
+-- /couch talents = plan + next points, /couch talents off|on.
+local BM, MM = "Beast Mastery", "Marksmanship"
+local TALENT_PATH = {}
+for _, step in ipairs({
+    { BM, 1, 2, 5 }, { BM, 2, 1, 2 }, { BM, 2, 3, 2 }, { BM, 1, 3, 1 }, { BM, 3, 1, 2 },
+    { BM, 3, 2, 1 }, { BM, 3, 3, 2 }, { BM, 4, 4, 1 }, { BM, 3, 3, 2 }, { BM, 4, 3, 2 },
+    { BM, 5, 2, 1 }, { BM, 5, 4, 2 }, { BM, 4, 3, 3 }, { BM, 6, 3, 4 }, { BM, 7, 2, 1 },
+    { MM, 1, 3, 5 }, { MM, 2, 3, 5 }, { MM, 3, 1, 2 }, { MM, 1, 1, 3 }, { MM, 4, 2, 1 },
+    { MM, 4, 3, 4 } }) do
+    for _ = 1, step[4] do TALENT_PATH[#TALENT_PATH + 1] = { step[1], step[2], step[3] } end
+end
+
+-- { [tree name] = { ["row:col"] = nodeID } }, configID
+local function talentGrid()
+    if not (C_Traits and C_Traits.GetTreeNodes and C_SpecializationInfo) then return nil end
+    local group = C_SpecializationInfo.GetActiveSpecGroup and C_SpecializationInfo.GetActiveSpecGroup() or 1
+    local configID = C_SpecializationInfo.GetCombatConfigIDForSpecGroup(group)
+    local cfg = configID and C_Traits.GetConfigInfo(configID)
+    local treeID = cfg and cfg.treeIDs and cfg.treeIDs[1]
+    if not treeID then return nil end
+    local names = {}
+    for _, d in ipairs(C_Traits.GetGroupDisplayInfoByTreeID(treeID) or {}) do names[d.groupID] = d.displayName end
+    local per = {}
+    for _, nodeID in ipairs(C_Traits.GetTreeNodes(treeID) or {}) do
+        local n = C_Traits.GetNodeInfo(configID, nodeID)
+        if n and n.isVisible ~= false and n.posX then
+            for _, g in ipairs(n.groupIDs or {}) do
+                if names[g] then
+                    per[names[g]] = per[names[g]] or {}
+                    table.insert(per[names[g]], n)
+                end
+            end
+        end
+    end
+    local function steps(list, key)
+        local vals, seen = {}, {}
+        for _, n in ipairs(list) do
+            if not seen[n[key]] then seen[n[key]] = true; vals[#vals + 1] = n[key] end
+        end
+        table.sort(vals)
+        local gap
+        for i = 2, #vals do
+            local d = vals[i] - vals[i - 1]
+            if d > 0 and (not gap or d < gap) then gap = d end
+        end
+        return vals[1], gap or 1
+    end
+    local grid = {}
+    for name, list in pairs(per) do
+        local x0, gx = steps(list, "posX")
+        local y0, gy = steps(list, "posY")
+        grid[name] = {}
+        for _, n in ipairs(list) do
+            local col = math.floor((n.posX - x0) / gx + 0.5) + 1
+            local row = math.floor((n.posY - y0) / gy + 0.5) + 1
+            grid[name][row .. ":" .. col] = n.ID
+        end
+    end
+    return grid, configID
+end
+
+local function talentName(configID, n)
+    local entryID = (n.activeEntry and n.activeEntry.entryID) or (n.entryIDs and n.entryIDs[1])
+    local e = entryID and C_Traits.GetEntryInfo(configID, entryID)
+    local d = e and e.definitionID and C_Traits.GetDefinitionInfo(e.definitionID)
+    if not d then return "?" end
+    return d.overrideName or (d.spellID and spellName(d.spellID)) or "?"
+end
+
+-- the next planned points: { { tree, row, col, nodeID, name, rank, max, canBuy } ... }
+local function talentNext(count)
+    local grid, configID = talentGrid()
+    if not grid then return nil end
+    local need, out = {}, {}
+    for i, t in ipairs(TALENT_PATH) do
+        local key = t[1] .. t[2] .. ":" .. t[3]
+        need[key] = (need[key] or 0) + 1
+        local nodeID = grid[t[1]] and grid[t[1]][t[2] .. ":" .. t[3]]
+        local n = nodeID and C_Traits.GetNodeInfo(configID, nodeID)
+        if not n then
+            out[#out + 1] = { t[1], t[2], t[3], nil, "(not found)", 0, 0, false, level = i + 9 }
+        elseif (n.ranksPurchased or 0) < need[key] then
+            out[#out + 1] = { t[1], t[2], t[3], nodeID, talentName(configID, n), n.ranksPurchased or 0,
+                n.maxRanks or 0, n.canPurchaseRank and true or false, level = i + 9 }
+        end
+        if #out >= (count or 1) then break end
+    end
+    return out, configID
+end
+
+local talentSnooze = false
+local function talentOffer(verbose)
+    if not isHunter() or InCombatLockdown() or CouchUIDB.talentsOff then return end
+    if talentSnooze and not verbose then return end
+    local ok, list, configID = pcall(talentNext, 1)
+    if not ok then return verbose and say("talents: " .. tostring(list)) end
+    local t = list and list[1]
+    if not t then return verbose and say("talents: plan complete (31 Beast Mastery / 20 Marksmanship)") end
+    local unspent = 0
+    pcall(function()
+        local cfg = C_Traits.GetConfigInfo(configID)
+        for _, c in ipairs(C_Traits.GetTreeCurrencyInfo(configID, cfg.treeIDs[1], false) or {}) do
+            unspent = unspent + (c.quantity or 0)
+        end
+    end)
+    if unspent <= 0 then t[8] = false end
+    if not t[8] then
+        if verbose then say("next talent in the plan: " .. t[1] .. " - " .. t[5] .. " (" .. t[6] .. "/" ..
+            t[7] .. ") - no point to spend yet") end
+        return
+    end
+    askReload("Talent point (level " .. t.level .. " in the guide's plan):\n|cffffd100" .. t[1] ..
+        " - " .. t[5] .. "|r  " .. (t[6] + 1) .. "/" .. t[7], function()
+        local bought = C_Traits.PurchaseRank(configID, t[4])
+        local applied = bought and C_Traits.CommitConfig(configID)
+        if applied then
+            say("learned |cffffd100" .. t[5] .. "|r " .. (t[6] + 1) .. "/" .. t[7])
+        elseif bought then
+            say(t[5] .. " picked - press |cffffd100Apply Changes|r in the talent window (N)")
+        else
+            say("|cffff6060couldn't learn " .. t[5] .. "|r - pick it in the talent window (N)")
+        end
+    end, function()
+        talentSnooze = true
+        say("talents: later - /couch talents shows the plan")
+    end, { noReload = true, yes = "Learn  (A)" })
+end
+
+local function watchTalents()
+    local fr = CreateFrame("Frame")
+    for _, ev in ipairs({ "PLAYER_LEVEL_UP", "TRAIT_CONFIG_UPDATED", "PLAYER_REGEN_ENABLED" }) do
+        pcall(fr.RegisterEvent, fr, ev)
+    end
+    local queued = false
+    fr:SetScript("OnEvent", function(_, ev)
+        if ev == "PLAYER_LEVEL_UP" then talentSnooze = false end
+        if queued then return end
+        queued = true
+        C_Timer.After(ev == "PLAYER_LEVEL_UP" and 3 or 1.5, function()
+            queued = false
+            pcall(talentOffer, false)
+        end)
+    end)
+end
+
+local function talentPlan()
+    local ok, list = pcall(talentNext, 6)
+    if not ok or not list then return say("talents: can't read the talent tree (" .. tostring(list) .. ")") end
+    if #list == 0 then return say("talents: plan complete") end
+    local lines = {}
+    for _, t in ipairs(list) do
+        lines[#lines + 1] = t.level .. ": " .. t[5] .. " (" .. t[1] .. " row " .. t[2] .. ", #" .. t[3] .. ")" ..
+            " (" .. t[6] .. "/" .. t[7] .. ")"
+    end
+    say("talent plan, next: " .. table.concat(lines, " | "))
+end
+
+-- ---- Controller vs keyboard: follows the controller, switches live (2.19) -------------
+-- Couch profile = controller UI (Easy Controller + CouchWheels + the game's gamepad
+-- interface), Desk = keyboard + mouse (Bartender4). Which one: is an Xbox controller
+-- connected (USB / Bluetooth)? Turn one on or off mid-game and the UI switches by itself
+-- (addons swapped, one /reload, out of combat). Per profile it keeps its own keybinds, Edit
+-- Mode layout, chat font / UI scale and addon profiles (Bartender4, Plater, Questie, BigWigs,
+-- TomTom: AceDB profiles named "Couch" / "Desk", first made as a copy of what you had).
+-- /couch mode [controller|desk|auto]  and the key "Toggle controller / keyboard mode"
+-- (Esc > Options > Keybindings > CouchUI; Ctrl-Shift-M at the desk) switch by hand; a manual
+-- choice holds until the next time a controller connects or disconnects.
+local COUCH_ON = { "EasyController", "CouchWheels" }
+local DESK_ON = { "Bartender4" }
+local INPUT_CVARS = {
+    Couch = { GamePadEnable = "1", InputDeviceInterfaceStyle = "1", SoftTargetEnemy = "1",
+              SoftTargetInteract = "1" },
+    Desk = { GamePadEnable = "1", InputDeviceInterfaceStyle = "0" },
+}
+
+local function controllerConnected()
+    if not (C_GamePad and C_GamePad.GetAllDeviceIDs) then return false end
+    local ok, ids = pcall(C_GamePad.GetAllDeviceIDs)
+    return ok and type(ids) == "table" and #ids > 0
+end
+
+local function wantedProfile()
+    local o = CouchUIDB.inputOverride
+    if o == "Couch" or o == "Desk" then return o end
+    return controllerConnected() and "Couch" or "Desk"
+end
+
+local function setInputCVars(name)
+    for k, v in pairs(INPUT_CVARS[name]) do
+        if GetCVar(k) ~= v then pcall(SetCVar, k, v) end
+    end
+end
+
+-- keyboard + mouse keybinds per profile (controller PAD* binds belong to Easy Controller)
+local function saveBinds(name)
+    local t = {}
+    for i = 1, GetNumBindings() do
+        local b = { GetBinding(i) }
+        local command = b[1]
+        for j = 3, #b do
+            local key = b[j]
+            if key and key ~= "" and not isPadKey(key) then t[key] = command end
+        end
+    end
+    CouchUIDB.binds = CouchUIDB.binds or {}
+    CouchUIDB.binds[name] = t
+end
+local function restoreBinds(name)
+    local t = CouchUIDB.binds and CouchUIDB.binds[name]
+    if not t or not next(t) or InCombatLockdown() then return false end
+    for i = 1, GetNumBindings() do
+        local b = { GetBinding(i) }
+        for j = 3, #b do
+            local key = b[j]
+            if key and key ~= "" and not isPadKey(key) and not t[key] then SetBinding(key) end
+        end
+    end
+    for key, command in pairs(t) do
+        if GetBindingAction(key) ~= command then SetBinding(key, command) end
+    end
+    SaveBindings(GetCurrentBindingSet())
+    return true
+end
+
+-- AceDB addons: profile "Couch" / "Desk" (made once as a copy of the profile in use)
+local function aceProfiles(name)
+    local AceDB = LibStub and LibStub("AceDB-3.0", true)
+    if not (AceDB and AceDB.db_registry) or CouchUIDB.aceOff then return 0 end
+    local changed = 0
+    for db in pairs(AceDB.db_registry) do
+        if not db.parent and db.GetCurrentProfile then   -- namespaces follow their addon
+            local ok = pcall(function()
+                local cur = db:GetCurrentProfile()
+                if cur == name then return end
+                local have = false
+                for _, n in ipairs(db:GetProfiles()) do if n == name then have = true end end
+                db:SetProfile(name)
+                if not have then db:CopyProfile(cur, true) end
+                changed = changed + 1
+            end)
+            if not ok then end
+        end
+    end
+    return changed
+end
+
+local switching = false
+local function switchTo(name, why, now)     -- now = from a key press / typed command
+    if switching or name == profileName() then return end
+    if InCombatLockdown() then
+        CouchUIDB.pendingSwitch = name
+        return say("switching to " .. (name == "Couch" and "controller" or "keyboard") ..
+            " mode after this fight")
+    end
+    -- never loop: one switch per 30 s (an addon that won't load would bounce forever)
+    if CouchUIDB.lastSwitch and time() - CouchUIDB.lastSwitch < 30 then
+        return say("|cffff6060mode switch did not take|r - /couch mode " ..
+            (name == "Couch" and "controller" or "desk") .. " to try again")
+    end
+    switching = true
+    local label = name == "Couch" and "controller" or "keyboard + mouse"
+    local from = profileName()
+    local function apply()
+        CouchUIDB.lastSwitch = time()
+        saveBinds(from)
+        local who = UnitName("player")
+        for _, a in ipairs(name == "Couch" and COUCH_ON or DESK_ON) do pcall(C_AddOns.EnableAddOn, a, who) end
+        for _, a in ipairs(name == "Couch" and DESK_ON or COUCH_ON) do pcall(C_AddOns.DisableAddOn, a, who) end
+        setInputCVars(name)
+        aceProfiles(name)
+    end
+    if now then       -- the press itself allows the reload: no second confirmation
+        apply()
+        say("switching to |cffffd100" .. label .. "|r mode...")
+        ReloadUI()
+        return
+    end
+    askReload((why or "") .. "Switch to |cffffd100" .. label .. "|r mode?", apply, function()
+        switching = false
+        CouchUIDB.inputOverride = from              -- stays until the controller comes / goes
+        say("staying in " .. (from == "Couch" and "controller" or "keyboard + mouse") ..
+            " mode - Ctrl-Shift-M or /couch mode switches later")
+    end)
+end
+
+-- called on login: the right input style + addon profiles for the profile that loaded,
+-- then switch if the controller says otherwise
+local function settleInput(name)
+    setInputCVars(name)
+    if aceProfiles(name) > 0 and not (CouchUIDB.lastSwitch and time() - CouchUIDB.lastSwitch < 30) then
+        CouchUIDB.lastSwitch = time()
+        askReload("Addon profiles (Bartender4, Plater, Questie...) switched to '" .. name ..
+            "' - reload to finish.")
+        return
+    end
+    local want = wantedProfile()
+    if want ~= name then switchTo(want) end
+end
+
+local function watchController()
+    local fr = CreateFrame("Frame")
+    fr:RegisterEvent("GAME_PAD_CONNECTED")
+    fr:RegisterEvent("GAME_PAD_DISCONNECTED")
+    fr:RegisterEvent("PLAYER_REGEN_ENABLED")
+    fr:RegisterEvent("PLAYER_LOGOUT")
+    local gen = 0
+    fr:SetScript("OnEvent", function(_, ev)
+        if ev == "PLAYER_LOGOUT" then pcall(saveBinds, profileName()); return end
+        if ev == "PLAYER_REGEN_ENABLED" then
+            local p = CouchUIDB.pendingSwitch
+            CouchUIDB.pendingSwitch = nil
+            if p then C_Timer.After(1, function() switchTo(p) end) end
+            return
+        end
+        CouchUIDB.inputOverride = nil          -- the hardware changed: back to automatic
+        gen = gen + 1
+        local mine = gen
+        -- connect: 2 s to settle; disconnect: 8 s (a Bluetooth blip must not reload the UI)
+        C_Timer.After(ev == "GAME_PAD_CONNECTED" and 2 or 8, function()
+            if mine ~= gen then return end
+            local want = wantedProfile()
+            if want ~= profileName() then
+                switchTo(want, want == "Couch" and "controller connected: " or "controller gone: ")
+            end
+        end)
+    end)
+end
+
+function CouchUI_ToggleMode()
+    local want = profileName() == "Couch" and "Desk" or "Couch"
+    CouchUIDB.inputOverride = want
+    CouchUIDB.lastSwitch = nil
+    switchTo(want, nil, true)
+end
+
 local function applyAll(quiet)
     if InCombatLockdown() then return say("leave combat first") end
     local p, name = prof()
@@ -1707,7 +2347,28 @@ local function applyAll(quiet)
     setScale(p.scale)
     if not CouchUIDB.macrosMade then makeMacros(); CouchUIDB.macrosMade = true end
     fixPetMacro()
+    if not quiet then restoreBinds(name) end      -- profile changed: its own keybinds back
     if name == "Desk" and not CouchUIDB.bindsApplied then applyBinds() end
+    if name == "Desk" and not CouchUIDB.bindsV3 and GetMacroIndexByName("Recruit") ~= 0 then
+        CouchUIDB.bindsV3 = true
+        local cur = GetBindingAction("CTRL-I")
+        if cur == "" or cur == "MACRO Recruit" then
+            SetBinding("CTRL-I", "MACRO Recruit")
+            SaveBindings(GetCurrentBindingSet())
+            say("|cffffd100Ctrl+I|r = Recruit: invites your target (or the next unguilded player near you) + whispers them")
+        else
+            say("Recruit: Ctrl+I is taken (" .. cur .. ") - bind the Recruit macro in Keybindings")
+        end
+    end
+    if name == "Desk" and CouchUIDB.bindsApplied and not CouchUIDB.bindsV2 then
+        CouchUIDB.bindsV2 = true
+        for i, k in ipairs({ "7", "8", "9", "0", "-", "=" }) do
+            if GetBindingAction(k) == "ACTIONBUTTON" .. (i + 6) then SetBinding(k) end
+        end
+        if GetBindingAction("CTRL-SHIFT-M") == "" then SetBinding("CTRL-SHIFT-M", "COUCHUI_TOGGLEMODE") end
+        SaveBindings(GetCurrentBindingSet())
+        say("desk keys: 7-0 - = moved to Q E R F T G; Ctrl-Shift-M = controller / keyboard mode")
+    end
     if name == "Couch" then
         patchWhisperNames()
         -- after Easy Controller and CouchWheels have set up this character's wheels
@@ -1729,6 +2390,10 @@ local function applyAll(quiet)
         if not ok then say("quest item: " .. tostring(err)) end
         pcall(questItemBags)
         pcall(questItemUpdate, false)
+        if name == "Desk" then
+            ok, err = pcall(deskPlace, false)
+            if not ok then say("desk keys: " .. tostring(err)) end
+        end
     end)
     if not quiet then say(name .. " profile applied. /couch for options.") end
     CouchUIDB.arranged = CouchUIDB.arranged or {}
@@ -1809,9 +2474,13 @@ f:SetScript("OnEvent", function()
         C_Timer.After(4, function() queued = false; pcall(hunterMacros, false) end)
     end)
     local last = CouchUIDB.lastProfile
+    pcall(watchController)
+    if isHunter() then pcall(watchTalents); C_Timer.After(8, function() pcall(talentOffer, false) end) end
     C_Timer.After(3, function()
         applyAll(last == profileName())
         CouchUIDB.lastProfile = profileName()
+        local ok, err = pcall(settleInput, profileName())
+        if not ok then say("controller/keyboard mode: " .. tostring(err)) end
     end)
 end)
 
@@ -1823,6 +2492,16 @@ SlashCmdList.COUCHUI = function(input)
     end
     if raw:lower():find("^recruit sent") then          -- from the Recruit macro: name as typed
         return recruitSent(strtrim(raw:sub(13)))
+    end
+    if raw:lower():find("^recruit msg") then
+        local text = strtrim(raw:sub(11))
+        if text == "" then
+            say("Recruit message: " .. (CouchUIDB.recruitMsg == false and "off" or (CouchUIDB.recruitMsg or RECRUIT_MSG)))
+            return say("/couch recruit msg <text> ({name}, {guild}) | /couch recruit msg off | /couch recruit msg default")
+        elseif text:lower() == "off" then CouchUIDB.recruitMsg = false
+        elseif text:lower() == "default" then CouchUIDB.recruitMsg = nil
+        else CouchUIDB.recruitMsg = text end
+        return say("Recruit message " .. (CouchUIDB.recruitMsg == false and "off" or "set"))
     end
     local cmd, arg = strsplit(" ", raw:lower(), 2)
     local p, name = prof()
@@ -1853,6 +2532,33 @@ SlashCmdList.COUCHUI = function(input)
         pcall(LoggingCombat, CouchUIDB.combatLog)
         say("Combat log for light sync + smart music " .. (CouchUIDB.combatLog and "on" or "off"))
     elseif cmd == "binds" then if arg == "undo" then undoBinds() else applyBinds() end
+    elseif cmd == "talents" then
+        if arg == "off" then CouchUIDB.talentsOff = true; say("talent prompts off")
+        elseif arg == "on" then CouchUIDB.talentsOff = nil; say("talent prompts on"); talentOffer(true)
+        else talentPlan(); talentSnooze = false; talentOffer(true) end
+    elseif cmd == "mode" then
+        if arg == "auto" then
+            CouchUIDB.inputOverride, CouchUIDB.lastSwitch = nil, nil
+            local want = wantedProfile()
+            say("mode: automatic (controller " .. (controllerConnected() and "connected" or "not connected") .. ")")
+            if want ~= name then switchTo(want, nil, true) end
+        elseif arg == "controller" or arg == "couch" or arg == "desk" or arg == "keyboard" then
+            local want = (arg == "desk" or arg == "keyboard") and "Desk" or "Couch"
+            CouchUIDB.inputOverride, CouchUIDB.lastSwitch = want, nil
+            if want == name then say("already in that mode (held until a controller connects / disconnects)")
+            else switchTo(want, nil, true) end
+        elseif arg == "profiles off" then CouchUIDB.aceOff = true; say("addon profiles: no longer switched")
+        elseif arg == "profiles on" then CouchUIDB.aceOff = nil; say("addon profiles: switched with the mode")
+        else
+            say("mode: " .. (name == "Couch" and "controller" or "keyboard + mouse") ..
+                " | controller " .. (controllerConnected() and "connected" or "not connected") ..
+                " | " .. (CouchUIDB.inputOverride and "held by hand" or "automatic") ..
+                "  - /couch mode controller|desk|auto, Ctrl-Shift-M toggles")
+        end
+    elseif cmd == "desk" then
+        if isLoaded("EasyController") then return say("desk keys are for desk mode (no TV)") end
+        if arg == "reset" then deskDB().done = {} end
+        deskPlace(true)
     elseif cmd == "rumble" then
         CouchUIDB.raptorRumble = (arg ~= "off")
         say("Raptor Strike ready buzz " .. (CouchUIDB.raptorRumble and "on" or "off"))
@@ -1874,7 +2580,14 @@ SlashCmdList.COUCHUI = function(input)
         elseif arg == "on" then CouchUIDB.bagSort = true; say("auto bag sort on: bags sort themselves when you close them")
         else sortBags(true) end
     elseif cmd == "recruit" then
-        if arg == "reset" then
+        if arg == "link" then
+            local link, guild = guildLink()
+            if link then say("Recruit: guild link " .. link .. " (goes into the whisper)")
+            else say("Recruit: no Guild Finder listing for <" .. tostring(guild) .. "> - the whisper uses the plain name. " ..
+                "An officer can list the guild: Guild & Communities > Guild Finder") end
+        elseif arg == "flash" then        -- test the PC side: no target = "/ginvite" just errors
+            recruitSignal(); say("Recruit: flash sent (the PC should type /ginvite)")
+        elseif arg == "reset" then
             local r = recruitDB(); r.done = {}; recruitDirty = true
             say("Recruit: forgot who was asked")
         elseif arg == "plates" or arg == "plates on" or arg == "plates off" then
@@ -1899,6 +2612,6 @@ SlashCmdList.COUCHUI = function(input)
     else
         say("profile: " .. name .. " | font " .. p.font .. " | scale " .. tostring(p.scale or "default"))
         say("/couch help = controller map (buttons, wheels, macros, music + voice shortcuts)")
-        say("/couch font 18 | /couch scale 0.9 | /couch scale off | /couch layout | /couch arrange [undo] | /couch macros [undo] | /couch binds [undo] | /couch social [off|rebind] | /couch emotes [off|rebind] | /couch recruit [plates|reset] | /couch sort [on|off|now] | /couch questitem [place] | /couch rumble on|off | /couch lights on|off")
+        say("/couch font 18 | /couch scale 0.9 | /couch scale off | /couch layout | /couch arrange [undo] | /couch macros [undo] | /couch binds [undo] | /couch mode [controller|desk|auto] | /couch talents [off|on] | /couch desk [reset] | /couch social [off|rebind] | /couch emotes [off|rebind] | /couch recruit [plates|reset] | /couch sort [on|off|now] | /couch questitem [place] | /couch rumble on|off | /couch lights on|off")
     end
 end

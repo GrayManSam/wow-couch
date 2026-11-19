@@ -1,0 +1,5 @@
+<Bindings>
+    <Binding name="COUCHUI_TOGGLEMODE" header="COUCHUI" category="ADDONS">
+        CouchUI_ToggleMode()
+    </Binding>
+</Bindings>

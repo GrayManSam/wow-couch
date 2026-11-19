@@ -1,0 +1,127 @@
+#!/usr/bin/python3 -I
+"""wow-recruit: types the guild invite for CouchUI's Recruit key at the desk.
+
+WoW Forever blocks guild invites from macros and addons, but a typed "/ginvite" works (with no
+name it invites the target). At the couch govee-wow does the typing (it reads the CouchLights
+strip from its screen capture). At the desk there is no capture, so CouchUI flashes a tiny
+magenta square in the top-left corner of the screen for ~0.6 s when the Recruit macro
+(Ctrl+I) has targeted someone. This service reads just those few pixels of the WoW window
+(XGetImage on a 6x6 area, 10 times a second, only while WoW is open) and then types
+Enter, "/ginvite", Enter, Esc - only if the WoW window has the keyboard focus.
+
+    wow-recruit            run (systemd user service wow-recruit.service)
+    wow-recruit test       report what the corner pixels read right now
+    wow-recruit type       type the invite once now (WoW must be focused)
+"""
+import ctypes
+import subprocess
+import sys
+import time
+
+POLL = 0.1             # seconds between pixel reads while WoW is open
+COOLDOWN = 2.5         # one invite per flash
+TOL = 24               # colour tolerance per channel
+SPOTS = ((1, 1), (2, 2), (3, 1), (1, 3))   # all must read magenta (255, 0, 255)
+
+x11 = ctypes.CDLL("libX11.so.6")
+x11.XOpenDisplay.restype = ctypes.c_void_p
+x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+x11.XGetImage.restype = ctypes.c_void_p
+x11.XGetImage.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
+                          ctypes.c_uint, ctypes.c_uint, ctypes.c_ulong, ctypes.c_int]
+x11.XGetPixel.restype = ctypes.c_ulong
+x11.XGetPixel.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+x11.XDestroyImage.argtypes = [ctypes.c_void_p]
+ERRFUNC = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+x11.XSetErrorHandler.argtypes = [ERRFUNC]
+_ignore = ERRFUNC(lambda d, e: 0)          # a window that vanished must not kill us
+x11.XSetErrorHandler(_ignore)
+ZPIXMAP, ALL_PLANES = 2, 0xFFFFFFFF
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def xdo(*args, timeout=3):
+    try:
+        return subprocess.run(["xdotool", *args], capture_output=True, text=True,
+                              timeout=timeout).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def wow_window():
+    ids = xdo("search", "--name", "^World of Warcraft$").split()
+    return int(ids[0]) if ids else None
+
+
+def corner(dpy, win):
+    img = x11.XGetImage(dpy, win, 0, 0, 6, 6, ALL_PLANES, ZPIXMAP)
+    if not img:
+        return None
+    try:
+        out = []
+        for x, y in SPOTS:
+            p = x11.XGetPixel(img, x, y)
+            out.append(((p >> 16) & 255, (p >> 8) & 255, p & 255))
+        return out
+    finally:
+        x11.XDestroyImage(img)
+
+
+def magenta(px):
+    return px is not None and all(r >= 255 - TOL and g <= TOL and b >= 255 - TOL for r, g, b in px)
+
+
+def type_invite(win):
+    if xdo("getactivewindow") != str(win):
+        log("recruit: WoW not focused - invite not typed")
+        return False
+    for step in (("key", "Return"), ("sleep", 0.7), ("type", "--delay", "45", "/ginvite"),
+                 ("sleep", 0.35), ("key", "Return"), ("sleep", 0.3), ("key", "Escape")):
+        if step[0] == "sleep":
+            time.sleep(step[1])
+        else:
+            xdo(*step)
+    log("recruit: typed /ginvite")
+    return True
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
+    dpy = x11.XOpenDisplay(None)
+    if not dpy:
+        sys.exit("wow-recruit: no X display")
+    if cmd == "test":
+        win = wow_window()
+        print("WoW window:", win, "corner:", win and corner(dpy, win),
+              "magenta:", bool(win and magenta(corner(dpy, win))))
+        return
+    if cmd == "type":
+        win = wow_window()
+        if win:
+            type_invite(win)
+        return
+    if cmd != "run":
+        print(__doc__.strip())
+        return
+    log("wow-recruit: watching for CouchUI's recruit flash")
+    win, last_find, last_fire, was = None, 0.0, 0.0, False
+    while True:
+        now = time.monotonic()
+        if win is None or now - last_find > 5:
+            win, last_find = wow_window(), now
+        if win is None:
+            time.sleep(3)
+            continue
+        hit = magenta(corner(dpy, win))
+        if hit and not was and now - last_fire > COOLDOWN:
+            last_fire = now
+            type_invite(win)
+        was = hit
+        time.sleep(POLL)
+
+
+if __name__ == "__main__":
+    main()
