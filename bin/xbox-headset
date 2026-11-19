@@ -601,7 +601,6 @@ def set_cfg(key, value):
     c = cfg()
     c[key] = value
     save(CFG, c)
-    pid = sh("systemctl", "--user", "show", "-p", "MainPID", "--value", "xbox-headset.service").strip()
     kick_service()
 
 

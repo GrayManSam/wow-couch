@@ -539,7 +539,8 @@ class Daemon:
             # pad-osk@local GNOME extension opens the keyboard directly (GNOME otherwise only
             # shows it after touchscreen input). Fallback: just flip the a11y setting.
             r = subprocess.run(["busctl", "--user", "call", "org.gnome.Shell", "/org/local/PadOsk",
-                                "org.local.PadOsk", "Toggle"], capture_output=True, text=True)
+                                "org.local.PadOsk", "Toggle"], capture_output=True, text=True,
+                               timeout=5)
             if r.returncode != 0:
                 notify("Keyboard helper not loaded yet: log out and back in once")
                 sh("gsettings", "set", "org.gnome.desktop.a11y.applications",
@@ -551,7 +552,7 @@ class Daemon:
             names = {7: "bottom", 1: "top", 6: "bottom left", 8: "bottom right",
                      0: "top left", 2: "top right", 4: "middle"}
             key = "/org/gnome/shell/extensions/gjsosk/default-snap"
-            r = subprocess.run(["dconf", "read", key], capture_output=True, text=True)
+            r = subprocess.run(["dconf", "read", key], capture_output=True, text=True, timeout=5)
             cur = int(r.stdout.strip()) if r.stdout.strip().isdigit() else 7
             nxt = order[(order.index(cur) + 1) % len(order)] if cur in order else 7
             sh("dconf", "write", key, str(nxt))
@@ -665,7 +666,10 @@ class Daemon:
         elif kind == "tap":
             self.out.tap(action[1], action[2])
         elif kind == "call":
-            self.call(action[1])
+            try:                              # a hung/failed helper must not kill the pad
+                self.call(action[1])
+            except (OSError, ValueError, subprocess.SubprocessError) as e:
+                log(f"{action[1]}: {e!r}")
         elif kind == "switch":
             self.out.key(K["ALT"], True)
             self.out.key(K["SHIFT"], action[1] < 0)

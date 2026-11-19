@@ -25,8 +25,12 @@
   wow-music moods [calm|steady|intense]   how the songs were sorted
   wow-music tag calm|steady|intense       re-sort the song playing right now (remembered)
   wow-music quality [lossless|very_high|high]   streaming quality of the headless player
-  wow-music eq [on|off]   TV speaker EQ for the music (own clean path: the game's compressor
-                        never touches the music). Bands: "eq_bands" in the config.
+  wow-music eq [on|off]   music EQ for Spotify on its own clean path (EasyEffects and the game's
+                        compressor never touch it). The curve follows the output: tv, laptop,
+                        airpods, earbuds, headphones, speaker (EQ_PROFILES; override with
+                        "eq_profiles" / pin devices with "eq_devices" in the config). The couch
+                        service routes the Spotify app through it whenever it plays, and
+                        switches the curve when the output changes (`wow-music eq-auto`).
   wow-music on | off    start with WoW or not (default on). While on, `battlenet --wow` also
                         switches the game's own music off (Sound_EnableMusic 0); off = back on.
 
@@ -84,16 +88,8 @@ DEFAULTS = {
     "intro_max": 75,      # look for the music's start in the first N seconds only
     "quality": "lossless",  # lossless (FLAC, up to 24-bit/44.1 kHz) | very_high (320) | high (160)
     "eq": True,           # music through its own TV-speaker EQ while the TV is the output
-    "eq_preamp": -4.0,    # dB, keeps the boosts below from clipping
-    "eq_bands": [         # type (highpass|lowshelf|peaking|highshelf), Hz, Q, gain dB
-        ["highpass", 45, 0.71, 0],     # nothing the TV speakers can play: saves headroom
-        ["lowshelf", 110, 0.7, 3.0],   # body the small drivers lack
-        ["peaking", 300, 1.0, -2.5],   # boxiness of a thin TV cabinet
-        ["peaking", 650, 1.4, -1.0],
-        ["peaking", 2800, 0.9, 1.5],   # clarity (down-firing speakers)
-        ["peaking", 7000, 2.5, -1.0],  # harshness
-        ["highshelf", 11000, 0.7, 2.0],  # air
-    ],
+    "eq_devices": {},     # device name -> curve, e.g. {"JBL Clip": "speaker"} (see EQ_PROFILES)
+    "eq_profiles": {},    # override/add curves: {"laptop": {"preamp": -6, "bands": [[type, Hz, Q, dB]...]}}
     "player": "auto",     # auto = Soloist (headless) when paired, else the desktop app; "app"
 }
 BUS = "org.mpris.MediaPlayer2.spotify"
@@ -142,7 +138,15 @@ def config():
 
 def save(cfg):
     CONF.mkdir(parents=True, exist_ok=True)
-    CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+    atomic_write(CONFIG, json.dumps(cfg, indent=2) + "\n")
+
+
+def atomic_write(path, text):
+    """Write via a temp file + rename: a crash or full disk never leaves a half-written file."""
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
 
 
 def to_uri(text):
@@ -370,7 +374,7 @@ def soloist_start(cfg, uri, session):
         log(f"Soloist build is {age} days old: updating")
         update()
     session.update(player="soloist", launched=not unit_active())
-    SESSION.write_text(json.dumps(session))
+    atomic_write(SESSION, json.dumps(session))
     if session["launched"]:
         ensure_quality(cfg)
         log("starting Soloist")
@@ -390,7 +394,7 @@ def soloist_start(cfg, uri, session):
     lead = 0
     if smart:                                     # smart mode opens on a song of its own choice
         lib = load_library()
-        playlist, uri = uri, pick_song(lib, cfg["moods"].get("world", "calm"))
+        uri = pick_song(lib, cfg["moods"].get("world", "calm"))   # one song; the smart daemon picks the rest
         lead = lib["tracks"][uri].get("lead", 0)
         ctl("shuffle", "off")
     else:
@@ -414,10 +418,10 @@ def soloist_start(cfg, uri, session):
         time.sleep(0.8)
         ctl("volume", str(cfg["volume"] if cfg["volume"] is not None else 70))
     session["started"] = True
-    SESSION.write_text(json.dumps(session))
+    atomic_write(SESSION, json.dumps(session))
     log(f"playing {uri} (headless): {soloist_track()}")
     if eq_route(cfg):
-        log("sound: music through the TV EQ (its own path, no game compressor)")
+        log("sound: music through its own EQ (no game compressor)")
     if smart_wanted(cfg):
         run("systemctl", "--user", "restart", SMART_UNIT, timeout=20)
         log("smart mode: the music follows the game")
@@ -476,9 +480,86 @@ def ensure_quality(cfg):
     return changed
 
 
-def eq_conf(cfg):
+# Music EQ per output: the curve follows where the sound goes (TV, laptop speakers, AirPods,
+# earbuds, headphones, Bluetooth speaker). Curves: "eq_profiles" in the config; a device can be
+# pinned to a curve by name: "eq_devices": {"JBL Clip": "speaker"}. Unknown outputs: no EQ.
+EQ_PROFILES = {
+    "tv": {"preamp": -4.5, "bands": [          # TV speakers, all genres
+        ["highpass", 45, 0.71, 0], ["lowshelf", 110, 0.7, 2.5], ["peaking", 250, 1.0, -2.0],
+        ["peaking", 500, 1.4, -1.0], ["peaking", 3000, 1.0, 1.0], ["peaking", 6500, 2.5, -1.5],
+        ["highshelf", 10000, 0.7, 2.5]]},
+    "laptop": {"preamp": -6.0, "bands": [      # Framework 16 speakers: no real bass below ~150 Hz
+        ["highpass", 120, 0.71, 0],            # protects the tiny drivers, no rattle on 808s
+        ["lowshelf", 220, 0.7, 4.0],           # upper bass the speakers CAN play = felt bass
+        ["peaking", 450, 1.2, -1.5],           # boxiness of the chassis
+        ["peaking", 2500, 1.2, -1.0],          # small speakers get shouty here
+        ["peaking", 5000, 2.0, 1.0],           # clarity
+        ["highshelf", 10000, 0.7, 2.5]]},      # air
+    "airpods": {"preamp": -3.0, "bands": [     # AirPods Pro 2: already well tuned, light touch
+        ["lowshelf", 105, 0.7, 1.5],           # a bit more kick/808 weight
+        ["peaking", 3500, 1.2, -1.0],          # slight edge on vocals/cymbals
+        ["highshelf", 9000, 0.7, 1.0]]},
+    "earbuds": {"preamp": -4.5, "bands": [     # budget Bluetooth earbuds (OpenPods etc.)
+        ["lowshelf", 100, 0.7, 2.0], ["peaking", 250, 1.0, -1.5],   # less boom/mud
+        ["peaking", 2500, 1.0, 1.5],           # vocals out of the mix
+        ["peaking", 6500, 2.5, -2.0],          # cheap-driver harshness
+        ["highshelf", 10000, 0.7, 2.0]]},
+    "headphones": {"preamp": -3.5, "bands": [  # over-ear / other headphones, both-headphones combo
+        ["lowshelf", 105, 0.7, 2.0], ["peaking", 3000, 1.0, 0.5],
+        ["peaking", 6000, 2.5, -1.5], ["highshelf", 10000, 0.7, 1.5]]},
+    "speaker": {"preamp": -5.0, "bands": [     # portable Bluetooth speakers (JBL Clip, GravaStar)
+        ["highpass", 70, 0.71, 0],             # below what they play: no pumping/distortion
+        ["lowshelf", 140, 0.7, 2.0], ["peaking", 350, 1.2, -2.0],
+        ["peaking", 2500, 1.0, 1.0], ["peaking", 6500, 2.5, -1.0],
+        ["highshelf", 10000, 0.7, 2.0]]},
+}
+
+
+def output_profile(cfg):
+    """(profile, output description) for where the sound goes now: the default sink."""
+    rc, raw = run("pactl", "-f", "json", "list", "sinks")
+    try:
+        sinks = {s["name"]: s for s in json.loads(raw)} if not rc else {}
+    except (ValueError, KeyError, TypeError):
+        sinks = {}
+    name = run("pactl", "get-default-sink")[1]
+    if name in (EQ_SINK, "easyeffects_sink"):       # look through to the real device
+        name = run("gsettings", "get", "com.github.wwmm.easyeffects.streamoutputs",
+                   "output-device")[1].strip("'")
+    props = sinks.get(name, {}).get("properties", {})
+    desc = props.get("device.description") or sinks.get(name, {}).get("description") or name
+    for key, prof in (cfg.get("eq_devices") or {}).items():
+        if key.lower() in desc.lower() or key.lower() in name.lower():
+            return prof if prof in eq_profiles(cfg) else None, desc
+    low, d = name.lower(), desc.lower()
+    if "hdmi" in low or "xbox_tv_headset" in low:
+        return "tv", desc
+    if low.startswith("alsa_output") and "speaker" in low:
+        return "laptop", desc
+    if low.startswith("bluez_output"):
+        ff = (props.get("device.form_factor") or "") + " " + (props.get("device.icon_name") or "")
+        if "airpods" in d:
+            return "airpods", desc
+        if any(k in ff for k in ("speaker", "portable", "hifi", "car")):
+            return "speaker", desc
+        if any(k in d for k in ("pods", "buds", "earbud")):
+            return "earbuds", desc
+        return "headphones", desc
+    if low == "combine_sink":
+        return "headphones", desc
+    return None, desc
+
+
+def eq_profiles(cfg):
+    profs = json.loads(json.dumps(EQ_PROFILES))
+    profs.update(cfg.get("eq_profiles") or {})
+    return profs
+
+
+def eq_conf(cfg, prof="tv"):
     nodes, links, prev = [], [], None
-    bands = [["highshelf", 0, 1.0, cfg["eq_preamp"]]] + list(cfg["eq_bands"])
+    curve = eq_profiles(cfg).get(prof) or EQ_PROFILES["tv"]
+    bands = [["highshelf", 0, 1.0, curve["preamp"]]] + list(curve["bands"])
     for i, (kind, freq, q, gain) in enumerate(bands):
         name = f"b{i}"
         nodes.append(f'{{ type = builtin name = {name} label = bq_{kind} '
@@ -487,7 +568,7 @@ def eq_conf(cfg):
             links.append(f'{{ output = "{prev}:Out" input = "{name}:In" }}')
         prev = name
     nl = "\n                    "
-    return f"""# written by wow-music - TV-speaker EQ for the music, on its own sink; regenerated on start
+    return f"""# written by wow-music - music EQ ({prof}), on its own sink; regenerated when the output changes
 context.properties = {{ log.level = 1 }}
 context.spa-libs = {{
     audio.convert.* = audioconvert/libspa-audioconvert
@@ -500,8 +581,8 @@ context.modules = [
     {{ name = libpipewire-module-adapter }}
     {{ name = libpipewire-module-filter-chain
         args = {{
-            node.description = "Music (TV EQ)"
-            media.name = "Music (TV EQ)"
+            node.description = "Music EQ ({prof})"
+            media.name = "Music EQ ({prof})"
             filter.graph = {{
                 nodes = [
                     {nl.join(nodes)}
@@ -519,11 +600,6 @@ context.modules = [
     }}
 ]
 """
-
-
-def tv_is_output():
-    sink = run("pactl", "get-default-sink")[1].lower()
-    return "hdmi" in sink or "xbox_tv_headset" in sink
 
 
 def eq_sink_up():
@@ -558,18 +634,19 @@ def route():
 
 
 def eq_route(cfg, wait=12):
-    """Music -> EQ sink -> TV while the TV is the output; plain default output otherwise."""
-    want = cfg["eq"] and tv_is_output()
-    if not want:
+    """Music -> EQ sink (curve for the current output) -> output; plain output when the
+    output has no curve or the EQ is off."""
+    prof = output_profile(cfg)[0] if cfg["eq"] else None
+    if not prof:
         run("systemctl", "--user", "stop", EQ_UNIT, timeout=20)
         return False
-    text = eq_conf(cfg)
+    text = eq_conf(cfg, prof)
     try:
         same = EQ_CONF.read_text() == text
     except OSError:
         same = False
     if not same:
-        EQ_CONF.write_text(text)
+        atomic_write(EQ_CONF, text)
     run("systemctl", "--user", "restart" if not same else "start", EQ_UNIT, timeout=20)
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
@@ -618,7 +695,7 @@ def start(cfg, force=False, dry=False):
         log("launching Spotify")
         subprocess.Popen(["spotify"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True)
-        SESSION.write_text(json.dumps(session))
+        atomic_write(SESSION, json.dumps(session))
         deadline = time.monotonic() + 45
         while not running():
             if time.monotonic() > deadline:
@@ -644,14 +721,14 @@ def start(cfg, force=False, dry=False):
             call("Play")
             if time.monotonic() > deadline:
                 log("Spotify did not start playing in 30s")
-                SESSION.write_text(json.dumps(session))
+                atomic_write(SESSION, json.dumps(session))
                 return 1
         session["started"] = True
         if cfg["shuffle"] and prop("Shuffle") is False:
             run("busctl", "--user", "set-property", BUS, OBJ, PLAYER, "Shuffle", "b", "true")
             call("Next")                          # so the session does not always open on track 1
         log(f"playing {uri}: {track()}")
-    SESSION.write_text(json.dumps(session))
+    atomic_write(SESSION, json.dumps(session))
     minimize()
     # Sound must come out of this computer: a stream shows up within a few seconds.
     for _ in range(16):
@@ -713,7 +790,8 @@ def status(cfg):
     except OSError:
         smart = None
     n = len(load_library().get("tracks", {}))
-    log(f"quality: {cfg['quality']}   TV EQ: {'on' if cfg['eq'] else 'off'}"
+    log(f"quality: {cfg['quality']}   music EQ: {'on' if cfg['eq'] else 'off'}"
+        + (f" ({output_profile(cfg)[0] or 'none for this output'})" if cfg["eq"] else "")
         + (" (active)" if eq_sink_up() else ""))
     log(f"mode: {cfg['mode']}" + (f"   now: {smart}" if smart else "")
         + (f"   library: {n} songs" if n else "   library: none (wow-music scan)"))
@@ -1514,9 +1592,28 @@ def main():
             save(cfg)
         log(cfg["playlist"])
         return 0
+    if cmd == "eq-auto":                         # couch service: Spotify playing on the TV
+        # (any time, not only WoW) -> through the music EQ; quiet no-op otherwise
+        prof = output_profile(cfg)[0] if cfg["eq"] else None
+        if not streams():
+            return 0
+        if not prof:
+            if eq_sink_up():                      # e.g. switched to an output with no curve
+                eq_route(cfg)
+            return 0
+        try:
+            same = EQ_CONF.read_text() == eq_conf(cfg, prof)
+        except OSError:
+            same = False
+        if eq_sink_up() and same:
+            route()
+        else:
+            eq_route(cfg, wait=8)                 # (re)starts it with this output's curve
+            log(f"music EQ: {prof}")
+        return 0
     if cmd == "route":
         n = route()
-        log("music path: " + ("no TV EQ running" if n is False else f"{n} stream(s) put back"
+        log("music path: " + ("no music EQ running" if n is False else f"{n} stream(s) put back"
                               if n else "ok"))
         return 0
     if cmd == "quality":
@@ -1542,8 +1639,9 @@ def main():
                 if not cfg["eq"]:
                     for idx, _ in streams():
                         run("pactl", "move-sink-input", idx, "@DEFAULT_SINK@")
-        log(f"eq: {'on' if cfg['eq'] else 'off'}"
-            + ("" if tv_is_output() else "  (only used while the TV is the output)"))
+        prof, desc = output_profile(cfg)
+        log(f"eq: {'on' if cfg['eq'] else 'off'}; output {desc} -> "
+            + (f"{prof} curve" if prof else "no curve (plain)"))
         return 0
     if cmd == "scan":
         rc = scan(cfg)

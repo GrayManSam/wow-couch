@@ -9,13 +9,21 @@
                    TV only while WoW runs (layout saved), previous layout back after;
                    no-op without a TV (the battlenet launcher runs this)
   couch display    re-apply the screen rule below now
+  couch sound [auto|day|night|off]
+                   TV sound preset for everything in couch mode (auto = Night 23-07)
+  couch underscan [on|off|auto]
+                   shrink the picture to fit a TV that crops its edges (per TV)
   couch daemon     background service (systemd: couchmode.service)
   --dry-run        with display / wow-display: check layouts with
                    `gdctl set --verify`, change and save nothing
 
-Screens (TV plugged in): TV only (4K, 200% scale or ~/.config/gameprofile/tv-scale,
-best refresh up to 60Hz - raise via ~/.config/gameprofile/tv-max-hz, laptop panel off) while the lid is closed, a WoW session runs,
-or `couch on` is set; with the lid open the laptop + TV layout comes back.
+Screens (TV plugged in): TV only (laptop panel off) while the lid is closed, a WoW session
+runs, or `couch on` is set; with the lid open the laptop + TV layout comes back.
+Each TV is read from its EDID: native resolution, the highest refresh the HDMI link really
+carries (HDMI card = 600 MHz: 4K60, 1440p120, 1080p120), desktop scale for a ~1920-wide
+desktop, HDR when the TV and GNOME support it, full RGB when the TV honors it. `couch` shows
+the plan; override with ~/.config/gameprofile/tv-<key> or tvs/<tv id>/<key>
+(resolution, max-hz, scale, hdr, rgb-range, link-mhz). WoW renderScale/maxFPS "auto" follow it.
 Couch mode: sound moves to the TV, controller desktop mode (pad) turns on, and WoW starts with
 Easy Controller + CouchWheels + couch graphics. Unplugging the TV puts everything back.
 A screen counts as the TV if its EDID is at least 100 cm wide or its name contains "TV".
@@ -49,17 +57,59 @@ ALWAYS_OFF = ["ConsolePort", "ConsolePort_Bar", "ConsolePort_Config", "ConsolePo
               "ConsolePort_Target", "ConsolePort_World",
               "QuestieTrace"]   # Questie's optional data recorder: not needed to play
 
+# (2026-11-18) Which UI WoW uses follows the CONTROLLER, not the screen: an Xbox controller
+# connected (USB, Bluetooth, wireless adapter) = controller UI (Easy Controller + wheels +
+# the game's gamepad interface), none = keyboard + mouse UI (Bartender4, desk keys) - at the
+# desk, on the laptop alone or on the TV. The TV only decides graphics, display, sound and
+# lights. In game, CouchUI switches live (and reloads once) when the controller comes or goes.
+INPUT_OVERRIDE = CONF / "input"           # auto | controller | desk
+INPUT_CVARS = {
+    # GamePadEnable stays 1 in both: the game must see a controller to switch to it.
+    # InputDeviceInterfaceStyle = Forever's "Enable Gamepad UI" (0 keyboard/mouse, 1 gamepad).
+    "controller": {"GamePadEnable": "1", "InputDeviceInterfaceStyle": "1",
+                   "SoftTargetEnemy": "1", "SoftTargetInteract": "1"},
+    "desk": {"GamePadEnable": "1", "InputDeviceInterfaceStyle": "0"},
+}
+
+
+def controller_connected():
+    """A real Xbox controller (same test as `pad`): gamepad buttons + a stick, name says Xbox
+    or Microsoft's vendor id; Steam Input / uinput pads are skipped, a Bluetooth LE pad
+    (/devices/virtual/misc/uhid/) counts."""
+    for ev in sorted(Path("/sys/class/input").glob("event*")):
+        try:
+            name = (ev / "device/name").read_text().strip().lower()
+            keybits = (ev / "device/capabilities/key").read_text().split()
+            absbits = int((ev / "device/capabilities/abs").read_text().split()[-1], 16)
+            vendor = (ev / "device/id/vendor").read_text().strip().lower()
+            where = str((ev / "device").resolve())
+        except (OSError, ValueError):
+            continue
+        real = "/devices/virtual/" not in where or "/uhid/" in where
+        pad = len(keybits) >= 5 and (int(keybits[-5], 16) >> 48) & 1 and absbits & 0b11
+        if real and pad and ("xbox" in name or vendor == "045e"):
+            return name
+    return None
+
+
+def input_mode():
+    o = read(INPUT_OVERRIDE, "auto")
+    if o in ("controller", "desk"):
+        return o
+    return "controller" if controller_connected() else "desk"
+
+
 DEFAULT_CVARS = {
     # TV: 4K output, render at 50% (1080p) and FSR-upscale; the 860M can't render native 4K.
-    "couch": {"renderScale": "0.5", "ResampleQuality": "3", "vsync": "1", "maxFPS": "60",
-              "GxMaximize": "1", "GamePadEnable": "1", "SoftTargetEnemy": "1",
-              "SoftTargetInteract": "1",
+    # renderScale/maxFPS "auto" follow the TV's mode (see wow_display_auto).
+    "couch": {"renderScale": "auto", "ResampleQuality": "3", "vsync": "1", "maxFPS": "auto",
+              "GxMaximize": "1",
               # sound on, System Default (= TV sink), keep playing without window focus
               "Sound_EnableAllSound": "1", "Sound_OutputDriverIndex": "0",
               "Sound_OutputDriverName": "System Default", "Sound_EnableSoundWhenGameIsInBG": "1"},
     # Desk: the settings tuned on 2026-11-09 for the laptop panel / monitor.
     "desk": {"renderScale": "0.75333333015442", "ResampleQuality": "3", "vsync": "0",
-             "maxFPS": "60", "GxMaximize": "1", "GamePadEnable": "1",
+             "maxFPS": "60", "GxMaximize": "1",
              "Sound_EnableAllSound": "1", "Sound_OutputDriverIndex": "0",
              "Sound_OutputDriverName": "System Default"},
 }
@@ -84,8 +134,16 @@ def read(path, default=""):
 
 
 def write(path, text):
-    CONF.mkdir(parents=True, exist_ok=True)
-    path.write_text(text + "\n")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(path, text + "\n")
+
+
+def atomic_write(path, text):
+    """Write via a temp file + rename: a crash or full disk never leaves a half-written file."""
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
 
 
 # ---- screens ------------------------------------------------------------------------
@@ -122,8 +180,10 @@ WOW_LAYOUT = CACHE / "layout-before-wow.json"   # exists = a WoW session holds t
 EXT_LAYOUT = CACHE / "layout-extended.json"     # last good lid-open layout (laptop + TV)
 LOCK = CACHE / "display.lock"
 TV_SCALE_FILE = CONF / "tv-scale"               # optional: TV-only scale (default 2 = 200%)
-TV_MAX_HZ_FILE = CONF / "tv-max-hz"             # TV refresh cap (default 60: the 3rd-gen
-                                                # HDMI card is HDMI 2.0b and goes black at 4K120)
+TV_MAX_HZ_FILE = CONF / "tv-max-hz"             # optional TV refresh cap (default: whatever
+                                                # the HDMI link carries, see HDMI_CARD_MHZ)
+HDMI_CARD_MHZ = 600     # 3rd-gen Framework HDMI card = HDMI 2.0b (600 MHz): 4K60 / 1440p120 /
+                        # 1080p120 fit, 4K120 is listed by mutter but goes black. tv-link-mhz overrides.
 WOW_PROCS = ("Wow.exe", "WowClassic.exe", "Battle.net.exe")
 BNET_SESSION = Path.home() / ".cache/battlenet/wow-session"   # written by the battlenet launcher
 DRY = False                                     # --dry-run: gdctl --verify, nothing saved
@@ -147,48 +207,60 @@ def drm_enabled(connector):
     return None
 
 
-def monitor_modes():
-    """{connector: [mode, ...]} from `gdctl show --modes`."""
-    out, conn = {}, None
-    for line in run("gdctl", "show", "--modes", timeout=5).stdout.splitlines():
-        m = re.search(r"Monitor (\S+) ", line)
-        if m:
-            conn = m[1]
-            out[conn] = []
-            continue
-        m = re.search(r"\d+x\d+@[\d.]+(\+vrr)?", line)
-        if m and conn and "Logical monitor" not in line:
-            out[conn].append(m[0])
-    return out
-
-
-def current_layout():
-    """[{x, y, scale, primary, transform, monitors: [{connector, mode}]}] from `gdctl show`."""
-    r = run("gdctl", "show", timeout=5)
-    modes, lms, sect, conn, want_mode, lm = {}, [], None, None, False, None
+# ---- what mutter and the TV can do -------------------------------------------------
+def gd_state():
+    """One parse of `gdctl show --modes --properties`:
+    ({connector: {modes, preferred, current, scales{mode: [..]}, color_modes, color_mode,
+    rgb_range}}, [logical monitors as in current_layout])."""
+    r = run("gdctl", "show", "--modes", "--properties", timeout=5)
+    mons, lms, sect, conn, mode, lm = {}, [], None, None, None, None
     for line in r.stdout.splitlines():
-        s = line.lstrip("│├└─ ")
+        s = line.lstrip("│├└─ ").strip()
         if line.startswith("Monitors:"):
             sect = "mon"
-        elif line.startswith("Logical monitors:"):
+            continue
+        if line.startswith("Logical monitors:"):
             sect = "lm"
-        elif sect == "mon":
+            continue
+        if line.startswith("Properties:"):
+            sect = None
+            continue
+        if sect == "mon":
             m = re.match(r"Monitor (\S+)", s)
             if m:
-                conn, want_mode = m[1], False
-            elif s.startswith("Current mode"):
-                want_mode = True
-            elif want_mode:
-                m = re.match(r"\d+x\d+@[\d.]+(\+vrr)?", s)
-                if m and conn:
-                    modes[conn] = m[0]
-                want_mode = False
+                conn, mode = m[1], None
+                mons[conn] = {"modes": [], "preferred": None, "current": None, "scales": {},
+                              "color_modes": ["default"], "color_mode": "default",
+                              "rgb_range": "auto", "underscan": False}
+                continue
+            if conn is None:
+                continue
+            info = mons[conn]
+            if re.fullmatch(r"\d+x\d+@[\d.]+(\+vrr)?", s):
+                mode = s
+                info["modes"].append(mode)
+            elif s.startswith(("Current mode", "Preferences", "Modes (")):
+                mode = None
+            elif s.startswith("Supported scales:") and mode:
+                info["scales"][mode] = [float(v) for v in re.findall(r"[\d.]+", s.split(":", 1)[1])]
+            elif s.startswith("is-current") and "yes" in s and mode:
+                info["current"] = mode
+            elif s.startswith("is-preferred") and "yes" in s and mode:
+                info["preferred"] = mode
+            elif s.startswith("supported-color-modes"):
+                info["color_modes"] = re.findall(r"[a-z0-9]+", s.split("⇒", 1)[1])
+            elif s.startswith("color-mode"):
+                info["color_mode"] = s.split("⇒", 1)[1].strip()
+            elif s.startswith("rgb-range"):
+                info["rgb_range"] = s.split("⇒", 1)[1].strip()
+            elif s.startswith("is-underscanning"):
+                info["underscan"] = "yes" in s
         elif sect == "lm":
             if s.startswith("Logical monitor"):
                 lm = {"x": 0, "y": 0, "scale": 1.0, "primary": False, "transform": "normal",
                       "monitors": []}
                 lms.append(lm)
-            elif lm is None:
+            elif lm is None or s.startswith(("Monitors", "Properties")):
                 continue
             elif s.startswith("Position:"):
                 lm["x"], lm["y"] = (int(v) for v in re.findall(r"-?\d+", s)[:2])
@@ -198,20 +270,211 @@ def current_layout():
                 lm["transform"] = s.split(":", 1)[1].strip()
             elif s.startswith("Primary:"):
                 lm["primary"] = "yes" in s
-            elif not s.startswith("Monitors"):
+            else:
                 m = re.match(r"(\S+) \(", s)
                 if m:
                     lm["monitors"].append({"connector": m[1]})
     for lm in lms:
         for mon in lm["monitors"]:
-            mon["mode"] = modes.get(mon["connector"])
-    return lms
+            info = mons.get(mon["connector"], {})
+            mon["mode"] = info.get("current")
+            mon["color_mode"] = info.get("color_mode", "default")
+            mon["rgb_range"] = info.get("rgb_range", "auto")
+            mon["underscan"] = info.get("underscan", False)
+    return mons, lms
+
+
+def monitor_modes():
+    """{connector: [mode, ...]}."""
+    return {c: i["modes"] for c, i in gd_state()[0].items()}
+
+
+def current_layout():
+    """[{x, y, scale, primary, transform, monitors: [{connector, mode, color_mode, rgb_range}]}]"""
+    return gd_state()[1]
+
+
+def edid_caps(edid):
+    """What the TV says it can do, from its raw EDID (base block + CTA-861 extensions)."""
+    caps = {"name": "", "width_cm": 0, "id": "unknown", "native": None, "hdr": False,
+            "bt2020": False, "rgb_qs": False, "max_tmds": 0, "hdmi21": False, "y420": False,
+            "allm": False, "vics": [], "s_ce": None}
+    if len(edid) < 128:
+        return caps
+    caps["name"], caps["width_cm"] = edid_info(edid)
+    v = edid[8] << 8 | edid[9]
+    vendor = "".join(chr(64 + (v >> sh & 31)) for sh in (10, 5, 0))
+    caps["id"] = re.sub(r"[^A-Za-z0-9]+", "-",
+                        f"{vendor}-{edid[10] | edid[11] << 8:04x}-{caps['name'] or 'display'}").strip("-")
+    d = edid[54:72]                                  # first detailed timing = native panel mode
+    if d[0] or d[1]:
+        caps["native"] = (d[2] | (d[4] & 0xF0) << 4, d[5] | (d[7] & 0xF0) << 4)
+    for blk in range(1, len(edid) // 128):
+        b = edid[blk * 128:(blk + 1) * 128]
+        if b[0] != 0x02:
+            continue
+        end, i = b[2], 4
+        while 4 <= i < end and i < 127:
+            tag, ln = b[i] >> 5, b[i] & 31
+            p = b[i + 1:i + 1 + ln]
+            if tag == 2:
+                caps["vics"] += [x & 0x7F for x in p]
+            elif tag == 3 and len(p) >= 3:
+                oui = p[2] << 16 | p[1] << 8 | p[0]
+                if oui == 0x000C03 and len(p) >= 7:          # HDMI 1.x VSDB
+                    caps["max_tmds"] = max(caps["max_tmds"], p[6] * 5)
+                elif oui == 0xC45DD8 and len(p) >= 5:        # HDMI Forum VSDB (HDMI 2.x)
+                    caps["max_tmds"] = max(caps["max_tmds"], p[4] * 5)
+                    caps["hdmi21"] = len(p) >= 7 and (p[6] >> 4) > 0
+                    caps["allm"] = len(p) >= 8 and bool(p[7] & 0x02)
+            elif tag == 7 and p:
+                ext = p[0]
+                if ext == 0 and len(p) >= 2:                 # video capability: RGB range selectable
+                    caps["rgb_qs"] = bool(p[1] & 0x40)
+                    caps["s_ce"] = p[1] & 0x03          # 1 = always overscans TV formats
+                elif ext == 5 and len(p) >= 2:               # colorimetry
+                    caps["bt2020"] = bool(p[1] & 0xE0)
+                elif ext == 6 and len(p) >= 2:               # HDR static metadata: PQ (ST 2084)
+                    caps["hdr"] = bool(p[1] & 0x04)
+                elif ext in (14, 15):                        # YCbCr 4:2:0 modes
+                    caps["y420"] = True
+            i += 1 + ln
+    return caps
+
+
+def tv_caps(conn):
+    for f in Path("/sys/class/drm").glob(f"card*-{conn}/edid"):
+        try:
+            return edid_caps(f.read_bytes())
+        except OSError:
+            break
+    return edid_caps(b"")
+
+
+def tv_setting(caps, key, default):
+    """Per-TV override (~/.config/gameprofile/tvs/<tv id>/<key>), else global tv-<key>."""
+    per_tv = CONF / "tvs" / caps["id"] / key
+    return read(per_tv) or read(CONF / f"tv-{key}") or default
+
+
+def tv_float(caps, key, default):
+    try:
+        return float(tv_setting(caps, key, ""))
+    except ValueError:
+        return default
+
+
+def parse_mode(m):
+    g = re.match(r"(\d+)x(\d+)@([\d.]+)", m or "")
+    return (int(g[1]), int(g[2]), float(g[3]), "+vrr" in m) if g else None
+
+
+def est_mhz(w, h, hz):
+    return w * h * hz * 1.15 / 1e6       # pixel clock incl. typical CTA blanking
+
+
+def tv_modes(info, caps):
+    """TV modes best first: native resolution at the highest refresh the HDMI link really
+    carries (mutter lists modes the DP side allows; the HDMI card/TV may not), then 60 Hz
+    native, the TV's preferred mode, and 1080p60 as the always-works fallback."""
+    limit = tv_float(caps, "link-mhz", HDMI_CARD_MHZ)
+    if caps["max_tmds"] and not caps["y420"] and not caps["hdmi21"]:
+        limit = min(limit, caps["max_tmds"] + 5)
+    max_hz = tv_float(caps, "max-hz", None)
+    parsed = [(parse_mode(m), m) for m in info.get("modes", [])]
+    ok = [(p, m) for p, m in parsed if p and est_mhz(*p[:3]) <= limit
+          and (max_hz is None or p[2] <= max_hz + 0.5)]
+    want = tv_setting(caps, "resolution", "")
+    pref = parse_mode(info.get("preferred"))
+    sizes = {(p[0], p[1]) for p, _ in ok}
+    for res in ([tuple(map(int, want.split("x")))] if re.fullmatch(r"\d+x\d+", want) else []) \
+            + [caps["native"], pref[:2] if pref else None]:
+        if res in sizes:
+            break
+    else:
+        res = max(sizes, key=lambda s: s[0] * s[1]) if sizes else None
+    pool = sorted(((p, m) for p, m in ok if (p[0], p[1]) == res),
+                  key=lambda x: (round(x[0][2]), x[0][3], x[0][2]), reverse=True)
+    out = [pool[0][1]] if pool else []
+    sixty = sorted((x for x in pool if round(x[0][2]) == 60),
+                   key=lambda x: (abs(x[0][2] - 60), not x[0][3]))
+    if sixty:
+        out.append(sixty[0][1])
+    if info.get("preferred"):
+        out.append(info["preferred"])
+    fhd = sorted((x for x in parsed if x[0] and x[0][:2] == (1920, 1080) and round(x[0][2]) == 60),
+                 key=lambda x: abs(x[0][2] - 60))
+    if fhd:
+        out.append(fhd[0][1])
+    seen = []
+    for m in out:
+        if m not in seen:
+            seen.append(m)
+    return seen or [None]
+
+
+def tv_scale_for(info, caps, mode):
+    """Desktop scale: ~1920 px wide logical desktop (couch distance) unless tv-scale is set;
+    always one of the scales mutter supports for that mode."""
+    p = parse_mode(mode)
+    want = tv_float(caps, "scale", max(1.0, p[0] / 1920) if p else 1.0)
+    supported = info.get("scales", {}).get(mode) or [1.0, 2.0]
+    return min(supported, key=lambda s: (abs(s - want), s))
+
+
+def tv_color(info, caps):
+    """(color_mode, rgb_range). HDR (bt2100) when the TV advertises PQ and mutter offers it
+    (tv-hdr: auto|on|off). RGB range full when the TV honors the range signal, else let
+    the driver pick per mode (tv-rgb-range: auto|full|limited to force it)."""
+    hdr = tv_setting(caps, "hdr", "auto")
+    offered = "bt2100" in info.get("color_modes", [])
+    color = "bt2100" if offered and (hdr == "on" or (hdr == "auto" and caps["hdr"])) else "default"
+    rgb = tv_setting(caps, "rgb-range", "auto")
+    if rgb not in ("auto", "full", "limited"):
+        rgb = "auto"
+    if rgb == "auto" and caps["rgb_qs"]:
+        rgb = "full"
+    return color, rgb
+
+
+def tv_underscan(caps):
+    """GNOME's 'Adjust for TV': shrink the picture ~5% per edge so a TV that overscans (crops
+    the edges / zooms) shows the whole desktop. tv-underscan: auto|on|off (`couch underscan`).
+    auto = on when the TV's EDID says it always overscans or says nothing about it (older
+    TVs); TVs that declare underscan/both get the full picture - set Just Scan on the TV."""
+    v = tv_setting(caps, "underscan", "auto")
+    if v in ("on", "off"):
+        return v == "on"
+    return caps["s_ce"] in (None, 0, 1)
+
+
+def tv_targets(tv, info):
+    """[(mode, scale, color_mode, rgb_range)] best first; HDR variants fall back to SDR."""
+    caps = tv_caps(tv)
+    color, rgb = tv_color(info, caps)
+    us = tv_underscan(caps)
+    out = []
+    for m in tv_modes(info, caps):
+        sc = tv_scale_for(info, caps, m)
+        for c in ([color, "default"] if color != "default" else ["default"]):
+            out.append((m, sc, c, rgb, us))
+    return out
+
+
+def tv_mon(tv, m, color, rgb, us=False):
+    mon = {"connector": tv, "mode": m, "underscan": us}
+    if m:
+        mon.update(color_mode=color, rgb_range=rgb)
+    return mon
 
 
 def layout_key(layout):
     return sorted((lm["x"], lm["y"], round(lm["scale"], 3), bool(lm["primary"]),
                    lm.get("transform", "normal"),
-                   tuple(sorted((m["connector"], m.get("mode") or "") for m in lm["monitors"])))
+                   tuple(sorted((m["connector"], m.get("mode") or "",
+                                 m.get("color_mode") or "default", m.get("rgb_range") or "auto",
+                                 bool(m.get("underscan")))
+                                for m in lm["monitors"])))
                   for lm in layout)
 
 
@@ -227,70 +490,103 @@ def layout_cmd(layout, verify=False):
         if lm.get("transform", "normal") != "normal":
             cmd += ["--transform", lm["transform"]]
         for mon in lm["monitors"]:
-            cmd += ["--monitor", mon["connector"]] + (["--mode", mon["mode"]] if mon.get("mode") else [])
+            cmd += ["--monitor", mon["connector"]]
+            if mon.get("mode"):
+                cmd += ["--mode", mon["mode"]]
+            if mon.get("color_mode"):
+                cmd += ["--color-mode", mon["color_mode"]]
+            if mon.get("rgb_range"):
+                cmd += ["--rgb-range", mon["rgb_range"]]
+            if mon.get("underscan"):
+                cmd += ["(underscan)"]
     return cmd
 
 
-def pick_modes(modes, res=None, max_hz=None):
-    """Best modes first: highest refresh (<= max_hz) at `res` (else the largest size);
-    60 Hz kept as fallback."""
-    parsed = []
-    for m in modes:
-        g = re.match(r"(\d+)x(\d+)@([\d.]+)", m)
-        if g and (max_hz is None or float(g[3]) <= max_hz + 0.5):
-            parsed.append((int(g[1]), int(g[2]), float(g[3]), "+vrr" in m, m))
-    pool = [p for p in parsed if f"{p[0]}x{p[1]}" == res] if res else []
-    if not pool and parsed:
-        big = max(p[0] * p[1] for p in parsed)
-        pool = [p for p in parsed if p[0] * p[1] == big]
-    pool.sort(key=lambda p: (p[2], p[3]), reverse=True)
-    out = [pool[0][4]] if pool else []
-    sixty = [p[4] for p in pool if round(p[2]) == 60]
-    if sixty and sixty[0] not in out:
-        out.append(sixty[0])               # fallback if the link can't carry the top refresh
-    return out or [None]
+def tv_layouts(tv, mons):
+    """TV-only targets: TV primary at its best mode, laptop panel off."""
+    return [[{"x": 0, "y": 0, "scale": sc, "primary": True, "transform": "normal",
+              "monitors": [tv_mon(tv, m, c, rgb, us)]}]
+            for m, sc, c, rgb, us in tv_targets(tv, mons.get(tv, {}))]
 
 
-def tv_max_hz():
-    try:
-        return float(read(TV_MAX_HZ_FILE, "60"))
-    except ValueError:
-        return 60.0
-
-
-def tv_scale():
-    try:
-        return float(read(TV_SCALE_FILE, "2"))
-    except ValueError:
-        return 2.0
-
-
-def tv_layouts(tv, modes):
-    """TV-only targets: TV primary at its best 4K mode, laptop panel off."""
-    return [[{"x": 0, "y": 0, "scale": tv_scale(), "primary": True, "transform": "normal",
-              "monitors": [{"connector": tv, "mode": m}]}]
-            for m in pick_modes(modes.get(tv, []), "3840x2160", tv_max_hz())]
-
-
-def extended_layouts(tv, modes):
+def extended_layouts(tv, mons):
     """Lid-open targets: the last saved laptop+TV layout, else laptop primary with the TV to its right."""
     out = []
     try:
         snap = json.loads(EXT_LAYOUT.read_text())
         if layout_connectors(snap) == {LAPTOP_MODE[0], tv}:
+            us = tv_underscan(tv_caps(tv))
+            for lm in snap:
+                for mon in lm["monitors"]:
+                    mon["underscan"] = us if mon["connector"] == tv else False
             out.append(snap)
     except (OSError, ValueError, KeyError, TypeError):
         pass
     conn, res, scale = LAPTOP_MODE
-    lap = pick_modes(modes.get(conn, []), res)[0]
-    tvm = pick_modes(modes.get(tv, []), "3840x2160", tv_max_hz())
+    lap = next((m for m in sorted(mons.get(conn, {}).get("modes", []),
+                                  key=lambda m: parse_mode(m)[2], reverse=True)
+                if m.startswith(res + "@")), None)
     width = int(res.split("x")[0])
-    for m in tvm:
+    for m, sc, c, rgb, us in tv_targets(tv, mons.get(tv, {})):
         out.append([{"x": 0, "y": 0, "scale": scale, "primary": True, "transform": "normal",
                      "monitors": [{"connector": conn, "mode": lap}]},
-                    {"x": round(width / scale), "y": 0, "scale": 1.0, "primary": False,
-                     "transform": "normal", "monitors": [{"connector": tv, "mode": m}]}])
+                    {"x": round(width / scale), "y": 0, "scale": sc, "primary": False,
+                     "transform": "normal", "monitors": [tv_mon(tv, m, c, rgb, us)]}])
     return out
+
+
+TRANSFORMS = {"normal": 0, "90": 1, "180": 2, "270": 3, "flipped": 4, "flipped-90": 5,
+              "flipped-180": 6, "flipped-270": 7}
+
+
+def dbus_apply(layout, verify=False):
+    """ApplyMonitorsConfig over D-Bus (what `gdctl set` does) plus 'underscanning', which
+    gdctl can't set. Temporary config: no 'keep changes?' dialog, monitors.xml untouched.
+    Returns None on success, else the error text."""
+    try:
+        import gi
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Gio, GLib
+        proxy = Gio.DBusProxy.new_for_bus_sync(
+            Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, None, "org.gnome.Mutter.DisplayConfig",
+            "/org/gnome/Mutter/DisplayConfig", "org.gnome.Mutter.DisplayConfig", None)
+        flags = Gio.DBusCallFlags.NO_AUTO_START
+        serial, monitors, _, props = proxy.call_sync("GetCurrentState", None, flags, 5000,
+                                                     None).unpack()
+        fallback = {}
+        for (conn, *_), modes, mprops in monitors:
+            ids = [md[0] for md in modes]
+            fallback[conn] = next((md[0] for md in modes if md[6].get("is-preferred")),
+                                  ids[0] if ids else None)
+        lms = []
+        for lm in layout:
+            mons = []
+            for m in lm["monitors"]:
+                opts = {}
+                if m.get("color_mode"):
+                    opts["color-mode"] = GLib.Variant("u", {"bt2100": 1}.get(m["color_mode"], 0))
+                if m.get("rgb_range"):
+                    opts["rgb-range"] = GLib.Variant(
+                        "u", {"full": 2, "limited": 3}.get(m["rgb_range"], 1))
+                if "underscan" in m:
+                    opts["underscanning"] = GLib.Variant("b", bool(m["underscan"]))
+                mode = m.get("mode") or fallback.get(m["connector"])
+                if not mode:
+                    return f"no mode for {m['connector']}"
+                mons.append((m["connector"], mode, opts))
+            lms.append((int(lm["x"]), int(lm["y"]), float(lm["scale"]),
+                        TRANSFORMS.get(lm.get("transform", "normal"), 0), bool(lm["primary"]),
+                        mons))
+        cfg = {}
+        if props.get("supports-changing-layout-mode") and "layout-mode" in props:
+            cfg["layout-mode"] = GLib.Variant("u", props["layout-mode"])
+        proxy.call_sync("ApplyMonitorsConfig",
+                        GLib.Variant("(uua(iiduba(ssa{sv}))a{sv})",
+                                     (serial, 0 if verify else 1, lms, cfg)),
+                        flags, 10000, None)
+        return None
+    except Exception as e:                # GLib.Error, ImportError, bad data
+        return str(e)
 
 
 def apply_layout(candidates, label):
@@ -300,13 +596,12 @@ def apply_layout(candidates, label):
     if cur and any(layout_key(cur) == layout_key(c) for c in candidates[:1]):
         return "unchanged"
     for c in candidates:
-        cmd = layout_cmd(c, verify=DRY)
-        r = run(*cmd, timeout=10)
+        err = dbus_apply(c, verify=DRY)
         if DRY:
-            print(("ok  " if r.returncode == 0 else "BAD ") + " ".join(cmd))
-            if r.returncode != 0:
-                print("    " + (r.stderr or r.stdout).strip()[:200])
-        if r.returncode == 0:
+            print(("ok  " if not err else "BAD ") + " ".join(layout_cmd(c, verify=True)))
+            if err:
+                print("    " + err[:200])
+        if not err:
             return "verified" if DRY else "applied"
     print(f"couch: {label} layout rejected by mutter", file=sys.stderr)
     return "failed"
@@ -341,13 +636,13 @@ def desired_display(ignore_wow=False):
 def ensure_display(kind, tv):
     if not kind or not tv:
         return "unchanged"
-    modes = monitor_modes()
+    mons = gd_state()[0]
     if kind == "tv":
-        return apply_layout(tv_layouts(tv, modes), "TV-only")
+        return apply_layout(tv_layouts(tv, mons), "TV-only")
     cur = current_layout()
     if LAPTOP_MODE[0] in layout_connectors(cur) and tv in layout_connectors(cur):
         return "unchanged"                # laptop + TV already up: keep the user's arrangement
-    return apply_layout(extended_layouts(tv, modes), "extended")
+    return apply_layout(extended_layouts(tv, mons), "extended")
 
 
 def save_extended_snapshot(layout=None):
@@ -357,7 +652,7 @@ def save_extended_snapshot(layout=None):
             or len(layout_connectors(layout)) < 2:
         return
     CACHE.mkdir(parents=True, exist_ok=True)
-    EXT_LAYOUT.write_text(json.dumps(layout))
+    atomic_write(EXT_LAYOUT, json.dumps(layout))
 
 
 def wow_running():
@@ -397,7 +692,7 @@ def wow_display(action, owner_pid=None):
             else:
                 CACHE.mkdir(parents=True, exist_ok=True)
                 save_extended_snapshot(data["layout"])
-                WOW_LAYOUT.write_text(json.dumps(data))
+                atomic_write(WOW_LAYOUT, json.dumps(data))
         if wow_running():
             print("wow-display start: Wine already running, layout left alone (would crash it)")
             return 0
@@ -553,6 +848,113 @@ def tv_audio():
     return None
 
 
+# Couch sound = EasyEffects on the TV for everything (browser movies, YouTube, games), not
+# only WoW: center dialog lifted, mud/boom cut, presence + de-esser, compressor + auto gain so
+# quiet voices and loud explosions/ads land closer together. A WoW session keeps its own
+# WoW / WoW-Night preset (`audio wow start/stop`) and puts the couch one back afterwards.
+EE_PRESETS = Path.home() / ".config/easyeffects/output"
+COUCH_PRESETS = ("Couch-TV", "Couch-TV-Night")   # night = 23:00-07:00: tighter dynamics
+COUCH_SOUND = CONF / "tv-sound"                   # auto | day | night | off
+DESK_PRESET = CONF / "desk-ee-preset"             # preset in use before couch mode
+
+
+def couch_preset():
+    v = read(COUCH_SOUND, "auto")
+    if v == "off":
+        return None
+    if v in ("day", "night"):
+        return COUCH_PRESETS[v == "night"]
+    h = time.localtime().tm_hour
+    return COUCH_PRESETS[h >= 23 or h < 7]
+
+
+def ee_running():
+    return run("pgrep", "-x", "easyeffects").returncode == 0
+
+
+def ee_preset():
+    return run("gsettings", "get", "com.github.wwmm.easyeffects",
+               "last-loaded-output-preset").stdout.strip().strip("'")
+
+
+def ensure_ee():
+    """Start EasyEffects as its own D-Bus service (same way as ~/.local/bin/audio)."""
+    if ee_running():
+        return True
+    run("gdbus", "call", "--session", "--dest", "org.freedesktop.DBus", "--object-path",
+        "/org/freedesktop/DBus", "--method", "org.freedesktop.DBus.StartServiceByName",
+        "com.github.wwmm.easyeffects", "0")
+    for _ in range(30):
+        if any(s.get("name") == EE_SINK for s in pactl_json("sinks")):
+            return True
+        time.sleep(0.2)
+    return ee_running()
+
+
+def couch_sound(force=False):
+    """Load the couch dialog preset. force (entering couch mode) = always; otherwise only
+    day <-> night switches and restarting a crashed EasyEffects - a preset the user picked
+    by hand is left alone. Returns the preset loaded, or None."""
+    want = couch_preset()
+    if not want or not (EE_PRESETS / f"{want}.json").exists() or session_active():
+        return None
+    cur = ee_preset()
+    running = ee_running()
+    if not force and (cur not in COUCH_PRESETS or (cur == want and running)):
+        return None
+    if cur and cur not in COUCH_PRESETS and not cur.startswith("WoW"):
+        write(DESK_PRESET, cur)
+    # EasyEffects follows the default sink (the TV now) and picks up every app stream
+    run("gsettings", "set", "com.github.wwmm.easyeffects.streamoutputs",
+        "use-default-output-device", "true")
+    run("gsettings", "set", "com.github.wwmm.easyeffects", "process-all-outputs", "true")
+    if not ensure_ee():
+        return None
+    run("easyeffects", "-l", want, timeout=10)
+    return want
+
+
+def desk_sound():
+    """Leaving couch mode: put back the preset from before (laptop speakers default)."""
+    if ee_preset() not in COUCH_PRESETS or not ee_running():
+        return
+    back = read(DESK_PRESET) or "Laptop-Speakers"
+    if (EE_PRESETS / f"{back}.json").exists():
+        run("easyeffects", "-l", back, timeout=10)
+
+
+MUSIC = Path.home() / ".local/bin/wow-music"
+MUSIC_EQ_SINK = "wow_music_eq"
+
+
+_music = {"retry": 0.0, "out": None}
+
+
+def music_eq_tick():
+    """Spotify playing (any mode) -> wow-music's music EQ with the curve for the current output
+    (TV, laptop, AirPods, earbuds, headphones, speaker); movies/browser stay on EasyEffects.
+    Cheap check; calls wow-music only when Spotify isn't on the music EQ yet (retry after 60 s
+    if that doesn't take) or the output changed (new curve)."""
+    out = run("pactl", "get-default-sink").stdout.strip()
+    sinks = {str(s.get("index")): s.get("name") for s in pactl_json("sinks")}
+    playing = off_eq = False
+    for si in pactl_json("sink-inputs"):
+        props = si.get("properties", {})
+        names = (props.get("application.name", ""), props.get("application.process.binary", ""))
+        if any("spotify" in n.lower() for n in names):
+            playing = True
+            off_eq |= sinks.get(str(si.get("sink"))) != MUSIC_EQ_SINK
+    if not playing or not MUSIC.exists():
+        _music["retry"], _music["out"] = 0.0, out
+        return False
+    changed = out != _music["out"]
+    if not changed and not (off_eq and time.monotonic() >= _music["retry"]):
+        return False
+    _music["out"], _music["retry"] = out, time.monotonic() + 60
+    run(str(MUSIC), "eq-auto", timeout=25)
+    return True
+
+
 def desk_audio():
     sink = read(SAVED_SINK)
     if sink and run("pactl", "set-default-sink", sink).returncode == 0:
@@ -582,7 +984,8 @@ def apply(profile, tv, announce=True):
                        + (" (display change failed)" if res == "failed" else ""))
             snd = tv_audio()
             if snd:
-                msg.append("sound → TV")
+                eq = couch_sound(force=True)
+                msg.append("sound → TV" + (f" ({eq})" if eq else ""))
         if prev != "couch":
             run(str(PAD), "on")
             msg.append("controller desktop mode on")
@@ -595,6 +998,7 @@ def apply(profile, tv, announce=True):
             if kind and not session_active():                        # TV unplugged: mutter already moved to what's left
                 ensure_display(kind, conn)
             desk_audio()
+            desk_sound()
             run(str(PAD), "off")
         write(CURRENT, "desk")
         if announce and prev == "couch":
@@ -603,6 +1007,7 @@ def apply(profile, tv, announce=True):
 
 def daemon():
     last = None
+    sound_check = music_check = 0.0
     screens = DisplayWatch()
     while True:
         try:
@@ -617,6 +1022,21 @@ def daemon():
             # still says couch but mutter/PipeWire came up with their defaults.
             apply(profile, tv, announce=last is not None or profile != read(CURRENT, "desk"))
             last = key
+        elif time.monotonic() - music_check >= 4:
+            music_check = time.monotonic()
+            try:
+                if music_eq_tick():
+                    print(f"sound: Spotify -> music EQ for {_music['out']}", flush=True)
+            except Exception as e:
+                print(f"music eq: {e!r}", flush=True)
+            if profile == "couch" and tv and time.monotonic() - sound_check >= 60:
+                sound_check = time.monotonic()
+                try:
+                    eq = couch_sound()    # 23:00 / 07:00 day <-> night, EasyEffects restart
+                    if eq:
+                        print(f"sound: {eq}", flush=True)
+                except Exception as e:
+                    print(f"sound: {e!r}", flush=True)
         time.sleep(2)
 
 
@@ -665,13 +1085,19 @@ def prune_combat_logs():
 
 def wow_prep():
     prune_combat_logs()
-    profile = read(CURRENT) or wanted_profile()[0]
+    # Decided fresh at every launch (not the last saved profile): no TV = desk, whatever
+    # else is plugged in - laptop screen + keyboard + mouse, a monitor, the dock.
+    profile = wanted_profile()[0]
     cfg = WOW / "WTF/Config.wtf"
     if not cfg.exists():
         return
     # WoW writes CRLF line endings; keep them (normalizing any LF-only lines too).
     text = cfg.read_bytes().decode("utf-8", "replace").replace("\r\n", "\n")
-    cvars = load_cvars(profile)
+    cvars = wow_display_auto(load_cvars(profile))
+    mode = input_mode()
+    for k in ("GamePadEnable", "InputDeviceInterfaceStyle", "SoftTargetEnemy", "SoftTargetInteract"):
+        cvars.pop(k, None)               # old profile files: input follows the controller now
+    cvars.update(INPUT_CVARS[mode])
     # Spotify plays during this session (battlenet --wow + wow-music on): game music off, so the
     # two never play over each other. Every other launch turns the game's own music back on.
     cvars["Sound_EnableMusic"] = "0" if os.environ.get("WOW_SPOTIFY") == "1" else "1"
@@ -681,8 +1107,8 @@ def wow_prep():
         if not n:
             text = text.rstrip("\n") + "\n" + line + "\n"
     cfg.write_bytes(text.replace("\n", "\r\n").encode())
-    on = COUCH_ADDONS_ON if profile == "couch" else DESK_ADDONS_ON
-    off = DESK_ADDONS_ON if profile == "couch" else COUCH_ADDONS_ON
+    on = COUCH_ADDONS_ON if mode == "controller" else DESK_ADDONS_ON
+    off = DESK_ADDONS_ON if mode == "controller" else COUCH_ADDONS_ON
     installed = {p.name for p in (WOW / "Interface/AddOns").iterdir()} \
         if (WOW / "Interface/AddOns").exists() else set()
     for addons in (WOW / "WTF/Account").glob("*/*/*/AddOns.txt"):
@@ -701,12 +1127,71 @@ def wow_prep():
             if a in state or a in installed:
                 state[a] = "disabled"
         addons.write_text("".join(f"{k}: {v}\n" for k, v in state.items()))
-    print(f"WoW set up for {profile} mode")
+    pad = controller_connected()
+    print(f"WoW set up: {profile} graphics, {mode} controls"
+          + (f" ({pad})" if pad and mode == "controller" else ""))
+
+
+def tv_report(tv):
+    """What the TV says it can do, what couch picks, and hints for TV-side settings."""
+    mons = gd_state()[0]
+    info, caps = mons.get(tv, {}), tv_caps(tv)
+    best = parse_mode(max(info.get("modes", []) or ["0x0@0"],
+                          key=lambda m: (parse_mode(m)[0] * parse_mode(m)[1], parse_mode(m)[2])))
+    feats = [f"native {caps['native'][0]}x{caps['native'][1]}" if caps["native"] else "native ?",
+             f"max offered {best[0]}x{best[1]}@{best[2]:g}" if best and best[0] else "",
+             f"HDMI {'2.1' if caps['hdmi21'] else '2.0' if caps['max_tmds'] > 340 else '1.x'}"
+             + (f" {caps['max_tmds']} MHz" if caps["max_tmds"] else ""),
+             "HDR10" if caps["hdr"] else "no HDR", "BT.2020" if caps["bt2020"] else "",
+             "4:2:0" if caps["y420"] else "", "ALLM" if caps["allm"] else "",
+             "RGB range switchable" if caps["rgb_qs"] else ""]
+    print(f"   TV id {caps['id']}: " + ", ".join(f for f in feats if f))
+    m, sc, color, rgb, us = tv_targets(tv, info)[0]
+    print(f"   TV-only plan: {m}, scale {sc:g}, color {color}, RGB {rgb}, "
+          f"underscan {'on' if us else 'off'}   (now: {info.get('current')}, "
+          f"{info.get('color_mode')}, RGB {info.get('rgb_range')}, "
+          f"underscan {'on' if info.get('underscan') else 'off'})")
+    print(f"   overrides: {CONF}/tv-<key> or {CONF}/tvs/{caps['id']}/<key>  "
+          "(keys: resolution, max-hz, scale, hdr, rgb-range, link-mhz, underscan)")
+    hints = []
+    if caps["width_cm"] >= 100 and best and best[0] and best[0] < 3840:
+        hints.append("TV only offers up to %dx%d. If it is a 4K TV, turn on the TV's enhanced "
+                     "HDMI mode for this input (LG: HDMI Ultra HD Deep Colour, Samsung: Input "
+                     "Signal Plus, Sony: Enhanced format, TCL/Hisense: HDMI 2.0) and replug."
+                     % best[:2])
+    if best and best[0] >= 3840 and not caps["hdr"]:
+        hints.append("No HDR advertised: the same TV setting usually unlocks HDR too.")
+    hints.append("Edges cut off: `couch underscan on` (this TV only). Black border instead: "
+                 "`couch underscan off` and set the TV's aspect ratio to Just Scan / Original / "
+                 "Screen Fit. Naming the input PC on the TV gives sharper text and less lag.")
+    for h in hints:
+        print("   hint: " + h)
+
+
+def wow_display_auto(cvars):
+    """renderScale / maxFPS = auto in wow-couch.cvars: follow the TV's planned mode
+    (render ~1080p and FSR-upscale - the 860M can't render native 4K; FPS = refresh)."""
+    if "auto" not in (cvars.get("renderScale"), cvars.get("maxFPS")):
+        return cvars
+    tv = tv_screen()
+    p = None
+    if tv:
+        mons = gd_state()[0]
+        p = parse_mode(tv_targets(tv[0], mons.get(tv[0], {}))[0][0])
+    w, hz = (p[0], p[2]) if p else (1920, 60.0)
+    if cvars.get("renderScale") == "auto":
+        cvars["renderScale"] = f"{min(1.0, 1920 / w):.3g}"
+    if cvars.get("maxFPS") == "auto":
+        cvars["maxFPS"] = str(max(30, round(hz)))
+    return cvars
 
 
 def show():
     o = read(OVERRIDE, "auto")
     print(f"🛋  profile: {read(CURRENT, 'desk')}  (mode: {o})")
+    pad = controller_connected()
+    print(f"   WoW controls: {input_mode()}  (input: {read(INPUT_OVERRIDE, 'auto')}; "
+          f"controller: {pad or 'none'})")
     for conn, name, width, tv in external_screens():
         print(f"   {conn}: {name or 'unknown'} {width} cm{'  ← TV' if tv else ''}")
     kind, _ = desired_display()
@@ -715,8 +1200,9 @@ def show():
           + {"tv": "TV only", "extended": "laptop + TV", None: "(no TV, GNOME decides)"}[kind]
           + ("  [WoW session holds TV-only]" if WOW_LAYOUT.exists() else "")
           + ("  [WoW/Battle.net running: layout frozen]" if session_active() else ""))
-    print(f"   TV-only: scale {tv_scale():g}, refresh cap {tv_max_hz():g} Hz "
-          f"({TV_MAX_HZ_FILE.name} in {CONF})")
+    tv = tv_screen()
+    if tv:
+        tv_report(tv[0])
     for lm in current_layout():
         mons = ", ".join(f"{m['connector']} {m.get('mode') or ''}" for m in lm["monitors"])
         print(f"   {'*' if lm['primary'] else ' '} ({lm['x']},{lm['y']}) x{lm['scale']:.2f}  {mons}")
@@ -739,6 +1225,11 @@ def main():
         profile, tv = wanted_profile()
         apply(profile, tv)
         show()
+    elif arg == "input":                  # couch input auto|controller|desk
+        if len(args) > 1 and args[1] in ("auto", "controller", "desk"):
+            write(INPUT_OVERRIDE, args[1])
+        print(f"WoW controls: {input_mode()} (input: {read(INPUT_OVERRIDE, 'auto')}, "
+              f"controller: {controller_connected() or 'none'})")
     elif arg == "wow-prep":
         wow_prep()
     elif arg == "wow-display":
@@ -751,6 +1242,30 @@ def main():
     elif arg == "display":                # re-apply the lid/WoW screen rule now
         kind, conn = desired_display()
         print(f"display: {kind or 'no TV'} -> {ensure_display(kind, conn)}")
+    elif arg == "underscan":              # couch underscan [on|off|auto] for the TV plugged in
+        tv = tv_screen()
+        if not tv:
+            print("underscan: no TV connected")
+            return
+        caps = tv_caps(tv[0])
+        f = CONF / "tvs" / caps["id"] / "underscan"
+        if len(args) > 1 and args[1] in ("on", "off", "auto"):
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(args[1] + "\n")
+            kind, conn = desired_display()
+            print(f"display: {kind} -> {ensure_display(kind, conn)}")
+        print(f"underscan for {caps['id']}: {tv_setting(caps, 'underscan', 'auto')} "
+              f"-> {'on' if tv_underscan(caps) else 'off'}")
+    elif arg == "sound":                  # couch sound [auto|day|night|off]
+        if len(args) > 1 and args[1] in ("auto", "day", "night", "off"):
+            write(COUCH_SOUND, args[1])
+            if read(CURRENT) == "couch":
+                if args[1] == "off":
+                    desk_sound()
+                else:
+                    couch_sound(force=True)
+        print(f"couch sound: {read(COUCH_SOUND, 'auto')} -> {couch_preset() or 'no EQ'}; "
+              f"EasyEffects {'running, preset ' + ee_preset() if ee_running() else 'off'}")
     elif arg == "status":
         show()
     else:
